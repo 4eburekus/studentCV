@@ -10,3 +10,47 @@ Background Tasks: Redis + Celery.
 Интеграции: requests / httpx.
 Деплой: Docker + Docker Compose.
 
+# Схема БД
+Исходная задача: Выделение категорий данных и построение реляционной схемы будущей базы данных. База должна учитывать хранение отчетов о посещаемости с привязкой к конкретной паре, предмету, расписанию, а также управлять биометрическими данными (добавление/удаление лиц студентов).
+
+Описание таблиц + ERD в соответствии с требованиями и user story:
+1. teachers. Закрывает требование — ограничение доступа — доступ только у авторизованного преподавателя.
+id (Integer, Primary Key)
+full_name (String) — ФИО преподавателя.
+login (String, Unique) — Логин для входа в десктопное/веб приложение.
+password_hash (String) — Хэш пароля (безопасность).
+
+2. students. Закрывает историю — управление базовыми данными.
+id (Integer, Primary Key)
+full_name (String, Not Null) — ФИО.
+group_number (String, Not Null) — Номер группы для фильтрации.
+is_active (Boolean, Default True) — Мягкое удаление (soft delete), если студент отчислен, чтобы не ломать старые журналы.
+
+3. student_photos (биометрия). Закрывает требования — хранение от 1 до 5 фото для устойчивости распознавания к очкам/прическам.
+id (Integer, Primary Key)
+student_id (Integer, Foreign Key) — Связь со студентом.
+photo_url (String, Not Null) — Здесь хранится не сама картинка, а строковый путь к файлу в S3/MinIO (например, biometrics/uuid.jpg).
+created_at (DateTime) — Дата загрузки (полезно для обновления базы лиц).
+
+4. disciplines. Закрывает требование — ведение журнала по схеме «Один журнал - одна дисциплина».
+id (Integer, Primary Key)
+name (String) — Название дисциплины.
+teacher_id (Integer, Foreign Key) — Привязка дисциплины к преподавателю.
+
+5. lessons. Закрывает историю — база для расчета опозданий.
+id (Integer, Primary Key)
+discipline_id (Integer, Foreign Key) — К какой дисциплине относится пара.
+lesson_date (Date) — Дата пары.
+start_time (Time) — Время начала (с ним AI-модуль будет сравнивать время входа студента).
+end_time (Time) — Время окончания.
+
+6. attendance_records (журнал посещаемости). Закрывает истории — фиксация точного времени захода студента в аудиторию; автоматическая фиксация статуса; возможность ручного редактирования записей журнала.
+id (Integer, Primary Key)
+student_id (Integer, Foreign Key) — Кто пришел.
+lesson_id (Integer, Foreign Key) — На какую пару пришел.
+entry_time (DateTime) — Точный штамп времени захода в аудиторию.
+status (Enum: PRESENT, LATE, ABSENT) — Статус. Вычисляется автоматически при записи.
+delay_minutes (Integer, Nullable) — Время задержки в минутах (если статус LATE).
+is_manually_edited (Boolean, Default False) — Индикатор «Отредактировано вручную».
+edited_at (DateTime, Nullable) — Когда преподаватель внес изменения (опционально, для логов).
+
