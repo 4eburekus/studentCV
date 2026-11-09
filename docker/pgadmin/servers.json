@@ -1,0 +1,29 @@
+{
+  "Servers": {
+    "1": {
+      "Name": "ksu-db",
+      "Group": "StudentCV",
+      "Host": "db",
+      "Port": 5432,
+      "MaintenanceDB": "studentcv",
+      "Username": "studentcv",
+      "Password": "${POSTGRES_PASSWORD}",
+      "SSLMode": "prefer",
+      "Shared": false,
+      "Servers": {
+        "1": {
+          "Name": "ksu-db",
+          "Group": "StudentCV",
+          "Host": "db",
+          "Port": 5432,
+          "MaintenanceDB": "studentcv",
+          "Username": "studentcv",
+          "Password": "${POSTGRES_PASSWORD}",
+          "SSLMode": "prefer"
+        }
+      }
+    }
+  },
+  "Tools": {},
+  "Browser": {}
+}

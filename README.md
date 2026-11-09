@@ -33,7 +33,7 @@ password_hash (String) — Хэш пароля (безопасность).
 2. students. Закрывает историю — управление базовыми данными.
 id (Integer, Primary Key)
 full_name (String, Not Null) — ФИО.
-group_number (String, Not Null) — Номер группы для фильтрации. (regex для группы '^\d{2}-[А-Я]{2}[а-я]{2,3}-\d{1}$')
+group_number (String, Not Null) — Номер группы для фильтрации. (regex для группы '^\d{2}-[А-ЯЁ]{3,4}[а-яё]{0,3}-\d{2}$')
 is_active (Boolean, Default True) — Мягкое удаление (soft delete), если студент отчислен, чтобы не ломать старые журналы.
 
 3. student_photos (биометрия). Закрывает требования — хранение от 1 до 5 фото для устойчивости распознавания к очкам/прическам.
@@ -72,3 +72,33 @@ edited_at (DateTime, Nullable) — Когда преподаватель вне�
 5 пара 15:40-17:10
 6 пара 17:20-18:50
 7 пара 19:00-20:30
+
+# Как поднять БД
+Docker: хранилище и backend живут в контейнерах, распознавание лиц - нативным процессом Windows (GPU и камера).
+
+## Первый запуск
+```
+cp .env.example .env
+docker compose up -d
+docker compose run --rm backend alembic upgrade head
+docker compose run --rm backend python -m db.seeds
+```
+- PostgreSQL: 127.0.0.1:5433
+- pgAdmin 4: http://127.0.0.1:5050 (логин/пароль - в .env)
+
+## Команды
+```
+docker compose ps                  # состояние сервисов
+docker compose logs -f db         # логи БД
+docker compose run --rm backend alembic current
+docker compose exec db psql -U studentcv -d studentcv
+docker compose down               # остановить (данные сохранятся)
+docker compose down -v            # ВНИМАНИЕ: удалить и БД, и volume с данными
+```
+
+## Бэкап
+```
+powershell -ExecutionPolicy Bypass -File scripts\backup.ps1
+```
+Дампы складываются в ./backups (ротация 10 последних). Восстановление - scripts\restore.ps1.
+Данные лежат в volume pgdata и не переносятся копированием папки - только дампом.

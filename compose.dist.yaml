@@ -1,0 +1,28 @@
+# Поставка на ПК преподавателя. Запуск явно:
+#   docker compose -f compose.yaml -f compose.dist.yaml up -d
+#
+# Отличие от dev: pgAdmin и dev-пробросы не входят в продукт, БД не публикуется наружу,
+# в образе пиннятся конкретные digest вместо тегов.
+#
+# Пример пиннинга по digest (обновлять при релизе, digest брать из `docker inspect`):
+#   image: postgres:16-alpine@sha256:<digest>
+
+services:
+  db:
+    ports: !reset null
+
+  pgadmin4: !reset null
+  backend: !reset null
+
+  # Заготовка следующего среза: раздача собранного Vite-фронта и прокси на backend.
+  # В этом срезе сервиса нет — раскомментировать вместе с появлением frontend/dist.
+  # caddy:
+  #   image: caddy:2-alpine
+  #   restart: unless-stopped
+  #   ports:
+  #     - "127.0.0.1:8000:80"
+  #   volumes:
+  #     - ./docker/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+  #     - ./frontend/dist:/srv:ro
+  #   networks:
+  #     - studentcv-net

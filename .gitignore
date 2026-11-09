@@ -1,0 +1,23 @@
+# Секреты и локальное окружение
+.env
+*.local
+
+# Данные и бэкапы
+backups/
+pgdata/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Alembic
+alembic/versions/__pycache__/
