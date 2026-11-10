@@ -23,6 +23,57 @@ services:
     networks:
       - studentcv-net
 
+  # Объектное хранилище: эталонные фото (biometrics) и доказательные кадры
+  # (frames).
+  #
+  # ОБРАЗ. MinIO в этой среде недоступен: Docker Hub отвечает "pull access
+  # denied" на любые теги minio/minio, quay.io - 401, dl.min.io - таймаут
+  # (postgres/busybox при этом тянутся, т.е. блокировка точечная по репо MinIO).
+  # Взяли SeaweedFS: публичный образ, Apache-2.0, S3-совместимый API.
+  #
+  # ВЕРСИЯ ЗАКРЕПЛЕНА: 4.53. Не ниже 4.49 - на 3.83 PutBucketVersioning
+  # отвечает NotImplemented 501 (проверено живым прогоном aioboto3), на 4.53
+  # возвращает Enabled. Versioning нам нужен как защита эталонов от потери,
+  # поэтому это не косметический пин.
+  #
+  # Отличия от MinIO, учтённые здесь:
+  #  - S3-API на порту 8333 (у MinIO был 9000);
+  #  - веб-консоли в стиле :9001 нет - администрирование через weed shell и
+  #    декларативный s3.json, отдельный сервис не нужен;
+  #  - учётки читаются из файла (-s3.config, высший приоритет), а не из
+  #    MINIO_ROOT_*; файл содержит секреты, поэтому генерится при старте из
+  #    env и кладётся в volume (см. docker/seaweedfs/entrypoint.sh);
+  #  - бакеты создаются приложением при старте (app.services.storage.ensure_buckets),
+  #    а не init-контейнером: versioning обязан включиться до первой записи,
+  #    и так нет гонки "backend успел раньше провижининга";
+  #  - healthcheck: занятый порт отдаёт 403 без кредов, это и есть признак
+  #    живого гейтвея. busybox wget считает 403 ошибкой, поэтому грепим код
+  #    из заголовков (проверено в контейнере).
+  storage:
+    image: chrislusf/seaweedfs:4.53
+    restart: unless-stopped
+    entrypoint: ["/bin/sh", "/init/entrypoint.sh"]
+    env_file:
+      - .env
+    environment:
+      STORAGE_ADMIN_ACCESS_KEY: ${STORAGE_ADMIN_ACCESS_KEY}
+      STORAGE_ADMIN_SECRET_KEY: ${STORAGE_ADMIN_SECRET_KEY}
+      CV_ACCESS_KEY: ${CV_ACCESS_KEY}
+      CV_SECRET_KEY: ${CV_SECRET_KEY}
+      S3_BUCKET_BIOMETRICS: ${S3_BUCKET_BIOMETRICS:-biometrics}
+      S3_BUCKET_FRAMES: ${S3_BUCKET_FRAMES:-frames}
+    volumes:
+      - seadata:/data
+      - ./docker/seaweedfs/entrypoint.sh:/init/entrypoint.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -S -qO /dev/null http://localhost:8333/ 2>&1 | grep -q '403'"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 15s
+    networks:
+      - studentcv-net
+
   migrate:
     build:
       context: .
@@ -44,6 +95,7 @@ services:
 
 volumes:
   pgdata:
+  seadata:
 
 networks:
   studentcv-net:

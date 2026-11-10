@@ -2,9 +2,9 @@
 .env
 *.local
 
-# Данные и бэкапы
+# Данные и бэкапы (дампы содержат реальные ФИО студентов)
 backups/
-pgdata/
+tests/_junit.xml
 
 # Python
 __pycache__/
@@ -21,3 +21,14 @@ Thumbs.db
 
 # Alembic
 alembic/versions/__pycache__/
+
+# Временные рабочие файлы и логи прогонов (_probe.py, _q.sql, _runsql.py и т.п.).
+# Слева ОБЯЗАТЕЛЬНО / - без якоря паттерн матчит на любом уровне и глушит
+# __init__.py (проверено: `_*.py` ловил app/__init__.py).
+/_*.py
+/_*.json
+/_*.txt
+/_*.sql
+/_*.bat
+/pull.log
+/manifest.txt

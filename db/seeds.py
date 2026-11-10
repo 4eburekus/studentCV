@@ -197,19 +197,16 @@ async def get_or_create_attendance(
 async def get_or_create_photos(
     session: AsyncSession, students: list[Student]
 ) -> None:
-    """Пара тестовых путей в MinIO - реальных файлов пока нет."""
-    if not students:
-        return
-    student = students[0]
-    photo_url = "biometrics/demo-0001.jpg"
-    photo = await session.scalar(
-        select(StudentPhoto).where(StudentPhoto.photo_url == photo_url)
-    )
-    if photo is None:
-        session.add(StudentPhoto(student_id=student.id, photo_url=photo_url))
-        print("created photo:", photo_url)
-    else:
-        print("photo exists:", photo_url)
+    """Эталонные фото сидами НЕ создаются.
+
+    С среза MinIO фото - не строка в БД, а объект в бакете: ключ
+    biometrics/<uuid4>.jpg проходит CHECK по формату, но ссылка на
+    несуществующий объект была бы хуже отсутствия данных (CV-модуль
+    молча терял бы эталон). Поэтому эталоны заводятся только через
+    POST /students/{id}/photos, который кладёт байты и пишет content_hash.
+    Функция оставлена пустой, чтобы не менять порядок вызовов main().
+    """
+    return None
 
 
 async def main() -> None:

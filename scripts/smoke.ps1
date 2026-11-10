@@ -107,6 +107,8 @@ $lowerGroup = "01-" + [char]0x0444 + [char]0x0438 + [char]0x0438 + [char]0x0442 
 $shortGroup = "01-" + [char]0x0424 + [char]0x0418 + [char]0x0442 + [char]0x0442 + "-01"
 # Dedicated group for the cascade test, so it does not touch attendance rows
 $cascadeGroup = "09-" + [char]0x0426 + [char]0x041A + [char]0x0410 + [char]0x0446 + [char]0x0446 + "-09"
+# Valid photo object key: biometrics/<uuid4>.jpg (format enforced by CHECK).
+$photoKey = "biometrics/" + [guid]::NewGuid().ToString().ToLower() + ".jpg"
 
 Write-Host "=== StudentCV smoke tests ==="
 Write-Host "valid group   : $validGroup"
@@ -157,6 +159,18 @@ where d.name = 'Smoke Discipline'
   );
 "@
 
+# Очистка перед проверками констрейнтов: если запись пары уже есть (прошлый
+# прогон), вставка с where not exists дала бы INSERT 0 0 - «успех» без
+# обращения к CHECK, и тест стал бы ложноположительным.
+Assert-SqlOk "clean attendance rows for the test pair" @"
+delete from attendance_records ar
+using students s, lessons l
+where ar.student_id = s.id
+  and ar.lesson_id = l.id
+  and s.group_number = '$validGroup'
+  and l.discipline_id = (select id from disciplines where name = 'Smoke Discipline' limit 1);
+"@
+
 Assert-SqlFails "reject LATE without delay_minutes" @"
 insert into attendance_records (student_id, lesson_id, entry_time, status)
 select s.id, l.id, now(), 'LATE'
@@ -203,11 +217,11 @@ where not exists (
 );
 
 insert into student_photos (student_id, photo_url)
-select id, 'biometrics/smoke-cascade.jpg'
+select id, '$photoKey'
 from students
 where group_number = '$cascadeGroup'
   and not exists (
-      select 1 from student_photos where photo_url = 'biometrics/smoke-cascade.jpg'
+      select 1 from student_photos where photo_url = '$photoKey'
   );
 "@
 
@@ -215,7 +229,7 @@ Assert-SqlOk "delete student cascades to photos" @"
 delete from students where group_number = '$cascadeGroup';
 "@
 
-$r = Invoke-Sql "select count(*) from student_photos where photo_url = 'biometrics/smoke-cascade.jpg';"
+$r = Invoke-Sql "select count(*) from student_photos where photo_url = '$photoKey';"
 if ($r.Output.Trim() -eq '0') {
     Write-Host "PASS  photos removed together with the student"
 }
@@ -232,6 +246,22 @@ from disciplines d
 where d.name = 'Smoke Discipline'
 limit 1;
 "@ 'end_after_start'
+
+# --- 6. photo key format CHECK (0002) -----------------------------------------
+# biometrics/<uuid4>.jpg passes, an arbitrary name must be rejected.
+Assert-SqlFails "reject photo_url not matching key format" @"
+insert into student_photos (student_id, photo_url)
+select id, 'biometrics/not-a-uuid.jpg'
+from students where group_number = '$validGroup' limit 1;
+"@ 'photo_key_format'
+
+Assert-SqlOk "accept photo_url with uuid4 key" @"
+insert into student_photos (student_id, photo_url, content_hash)
+select id, '$photoKey', repeat('a', 64)
+from students where group_number = '$validGroup' limit 1;
+
+delete from student_photos where photo_url = '$photoKey';
+"@
 
 Write-Host ""
 if ($script:Failures -eq 0) {

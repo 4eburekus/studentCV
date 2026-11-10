@@ -8,6 +8,7 @@ from datetime import date, datetime, time
 
 from sqlalchemy import (
     Boolean,
+    CHAR,
     CheckConstraint,
     Date,
     DateTime,
@@ -31,6 +32,22 @@ from db.enums import AttendanceStatus
 # номер курса двумя цифрами. Реальные номера групп КГУ встречаются
 # и как ФИИтт (3+2), и как ТИПП (4+0), поэтому длины заданы диапазоном.
 GROUP_NUMBER_REGEX = r"^\d{2}-[А-ЯЁ]{3,4}[а-яё]{0,3}-\d{2}$"
+
+# Формат ключа объекта эталонного фото в бакете biometrics:
+# biometrics/<uuid4>.jpg. Жёсткий формат нужен, чтобы CV-модуль и API
+# не разошлись в допущениях об именах файлов: ключ проверяется CHECK'ом.
+# Совпадает с str(uuid.uuid4()) + ".jpg" (нижний регистр, дефисы).
+PHOTO_KEY_REGEX = (
+    r"^biometrics/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}"
+    r"-[0-9a-f]{4}-[0-9a-f]{12}\.jpg$"
+)
+
+# Ключ доказательного кадра задаёт НЕ модель, а app/services/storage.py:
+# new_frame_key() - единственная точка генерации, FRAME_KEY_RE - валидатор на
+# входе. В БД ключ кадра не хранится и CHECK на него невозможен, поэтому
+# дублировать схему здесь смысла нет: два описания одного контракта
+# неизбежно разъезжаются (правило, которое мы уже проходили на regex номера
+# группы).
 
 
 class TimestampMixin:
@@ -105,14 +122,22 @@ class Student(Base, TimestampMixin):
 class StudentPhoto(Base, TimestampMixin):
     """Эталонное фото студента для распознавания.
 
-    Хранится не картинка, а путь к файлу в S3/MinIO (biometrics/<uuid>.jpg).
-    Правило "от 1 до 5 фото" проверяется в сервисном слое следующего среза:
+    Хранится не картинка, а ключ объекта в бакете MinIO
+    (biometrics/<uuid4>.jpg), формат проверяется CHECK'ом.
+    Правило "от 1 до 5 фото" проверяется в сервисном слое (app/services/photos.py):
     ограничение на количество строк через CHECK не выражается.
     """
 
     __tablename__ = "student_photos"
     __table_args__ = (
         UniqueConstraint("photo_url", name="uq_student_photos_photo_url"),
+        CheckConstraint(
+            f"photo_url ~ '{PHOTO_KEY_REGEX}'",
+            name="photo_key_format",
+        ),
+        # Поиск дубликатов эталонов (одно лицо на нескольких фото) и
+        # сверка «БД <-> бакет» идут по этому индексу.
+        Index("ix_student_photos_content_hash", "content_hash"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -121,6 +146,10 @@ class StudentPhoto(Base, TimestampMixin):
         nullable=False,
     )
     photo_url: Mapped[str] = mapped_column(String(512), nullable=False)
+    # SHA-256 содержимого объекта (hex, нижний регистр, 64 символа).
+    # Нужен, чтобы сверять «строка есть - объект на месте» без скачивания
+    # файлов. Nullable: демо-строки среза БД хэша не имеют.
+    content_hash: Mapped[str | None] = mapped_column(CHAR(64), nullable=True)
 
     student: Mapped["Student"] = relationship(back_populates="photos")
 

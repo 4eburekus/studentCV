@@ -3,6 +3,12 @@ services:
     ports:
       - "127.0.0.1:5433:5432"
 
+  # Dev: публикуем S3-API, чтобы к нему шёл нативный CV-процесс с хост-машины
+  # (он вне сети studentcv-net) и чтобы бакеты смотреть руками при приёмке.
+  storage:
+    ports:
+      - "127.0.0.1:8333:8333"
+
   pgadmin4:
     image: dpage/pgadmin4:8
     restart: unless-stopped
@@ -24,6 +30,7 @@ services:
     networks:
       - studentcv-net
 
+  # Dev-режим: hot-reload за счёт bind-mount исходников, образ не пересобираем.
   backend:
     build:
       context: .
@@ -31,21 +38,39 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    # S3_*, DATABASE_URL и AUTH_* приходят из env_file (.env) - не дублируем
+    # их здесь: второе определение значения настраивает на расхождение.
     environment:
-      DATABASE_URL: ${DATABASE_URL}
       SQL_ECHO: ${SQL_ECHO:-0}
-    command: ["sleep", "infinity"]
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    ports:
+      - "127.0.0.1:8000:8000"
     volumes:
+      - ./app:/app/app
       - ./db:/app/db
       - ./alembic:/app/alembic
       - ./alembic.ini:/app/alembic.ini
+      # Тесты НЕ входят в прод-образ (см. docker/backend.Dockerfile),
+      # но должны быть доступны из dev-контейнера: запуск pytest отсюда.
+      - ./tests:/app/tests
+      - ./pytest.ini:/app/pytest.ini
+      # Каталог бэкапов: и дамп хранилища (app.tools.storage_backup), и
+      # сверка verify_objects пишутся прямо на хост. Дамп в /tmp контейнера
+      # теряется вместе с ним - один дамп мы так уже потеряли.
+      - ./backups:/backups
     depends_on:
       db:
         condition: service_healthy
+      storage:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/healthz', timeout=3).status == 200 else 1)\""]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
     networks:
       - studentcv-net
-    profiles:
-      - tools
 
 volumes:
   pgadmin_data:

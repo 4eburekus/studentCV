@@ -1,26 +1,57 @@
 # Поставка на ПК преподавателя. Запуск явно:
 #   docker compose -f compose.yaml -f compose.dist.yaml up -d
 #
-# Отличие от dev: pgAdmin и dev-пробросы не входят в продукт, БД не публикуется наружу,
-# в образе пиннятся конкретные digest вместо тегов.
+# Отличия от dev: pgAdmin исключён из продукта, у БД порты не публикуются,
+# backend и хранилище становятся службами. Образы в релизе пиннятся по digest.
 #
-# Пример пиннинга по digest (обновлять при релизе, digest брать из `docker inspect`):
-#   image: postgres:16-alpine@sha256:<digest>
+# ПУБЛИЧНЫЙ ПОРТ S3 - первое реальное исключение из принципа «наружу только
+# порт приложения». Нативный CV-процесс живёт вне сети studentcv-net и
+# обращается в хранилище по 127.0.0.1:8333, поэтому 8333 публикуем. Привязка
+# к loopback сохраняет требование №11: извне машины доступ закрыт.
+# Согласовано 10.11.2026: вариант, где CV-процессу доступен S3-API.
+#
+# У хранилища в поставке нет админ-порта: веб-консоли у SeaweedFS нет, а
+# internal-порты (9333 master, 8888 filer, 9666 filer-ui) наружу не идут -
+# в dev они тоже не публикуются.
 
 services:
   db:
     ports: !reset null
 
+  storage:
+    ports:
+      - "127.0.0.1:8333:8333"
+
   pgadmin4: !reset null
-  backend: !reset null
+
+  backend:
+    build: !reset null
+    image: studentcv-backend:0.2
+    restart: unless-stopped
+    env_file:
+      - .env
+    # DATABASE_URL и S3_* приходят из .env (в поставке S3_ENDPOINT=http://storage:8333).
+    # Здесь переопределяется ровно одно значение: заглушка авторизации не имеет
+    # права уехать в прод, приложение с AUTH_STUB_ENABLED=false не стартует
+    # (app.core.config.validate_settings), пока требование №11 не закрыто
+    # реальным входом.
+    environment:
+      AUTH_STUB_ENABLED: "false"
+    volumes: !reset null
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      storage:
+        condition: service_healthy
 
   # Заготовка следующего среза: раздача собранного Vite-фронта и прокси на backend.
-  # В этом срезе сервиса нет — раскомментировать вместе с появлением frontend/dist.
   # caddy:
   #   image: caddy:2-alpine
   #   restart: unless-stopped
   #   ports:
-  #     - "127.0.0.1:8000:80"
+  #     - "127.0.0.1:8080:80"
   #   volumes:
   #     - ./docker/caddy/Caddyfile:/etc/caddy/Caddyfile:ro
   #     - ./frontend/dist:/srv:ro

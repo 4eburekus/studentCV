@@ -5,7 +5,7 @@ Frontend: Vite + React (+ Tailwind CSS, MUI или другие для быст�
 Backend: Python 3.10+ + FastAPI.
 Computer Vision / AI: OpenCV (захват RTSP-потока) + PyTorch/InsightFace для распознавания лиц (распознавание с GPU CUDA).
 Database и ORM: PostgreSQL + SQLAlchemy + Alembic.
-Storage (картинки): MinIO (будет смонтирована в Docker).
+Storage (картинки): SeaweedFS (S3-совместимое хранилище, смонтировано в Docker).
 Background Tasks: Redis + Celery.
 Интеграции: requests / httpx.
 Деплой: Docker + Docker Compose.
@@ -15,7 +15,7 @@ Background Tasks: Redis + Celery.
 - Backend (Python 3.10+ + FastAPI): Выбран за встроенную асинхронность и высокую скорость работы, что критически необходимо для стабильной обработки параллельных запросов от интерфейса, камер и фоновых задач.
 - Computer Vision / AI (OpenCV + PyTorch/InsightFace): Является ядром системы для захвата видеопотока в реальном времени (OpenCV) и обеспечения требуемой точности распознавания лиц не ниже 95% за счет аппаратного ускорения на видеокартах (InsightFace + CUDA (NVIDIA)).
 - Database и ORM (PostgreSQL + SQLAlchemy + Alembic): Надежная реляционная база данных в связке с современными инструментами управления структурой (ORM/миграции) гарантирует безопасное хранение расписания, отчетов и связей с биометрическими профилями студентов.
-- Storage (MinIO): Локальное S3-совместимое хранилище позволит безопасно и эффективно хранить эталонные фотографии (биометрию) изолированно от базы данных, предотвращая ее раздувание и падение производительности.
+- Storage (SeaweedFS): Локальное S3-совместимое хранилище позволяет безопасно и эффективно хранить эталонные фотографии (биометрию) и доказательные кадры изолированно от базы данных, предотвращая ее раздувание и падение производительности. Приложение говорит с ним по generic S3 API (aioboto3), поэтому замена продукта за эндпоинтом кода приложения не касается. MinIO был заменён: официальные образы недоступны для загрузки из нашей среды.
 - Background Tasks (Redis + Celery): Связка необходима для обработки ресурсоемких задач в фоновом режиме, что исключает зависание интерфейса и гарантирует передачу отметок в электронный журнал КГУ без потерь даже при временных сбоях сети.
 - Интеграции (requests / httpx): Эти HTTP-клиенты обеспечат надежную маршрутизацию и отправку данных из нашей системы напрямую во внешнее API существующего электронного журнала университета.
 - Деплой (Docker + Docker Compose): Контейнеризация гарантирует быстрое, изолированное и безошибочное развертывание всей сложной архитектуры проекта (включая специфические зависимости нейросетей) на серверах КГУ.
@@ -39,7 +39,7 @@ is_active (Boolean, Default True) — Мягкое удаление (soft delete
 3. student_photos (биометрия). Закрывает требования — хранение от 1 до 5 фото для устойчивости распознавания к очкам/прическам.
 id (Integer, Primary Key)
 student_id (Integer, Foreign Key) — Связь со студентом.
-photo_url (String, Not Null) — Здесь хранится не сама картинка, а строковый путь к файлу в S3/MinIO (например, biometrics/uuid.jpg).
+photo_url (String, Not Null) — Здесь хранится не сама картинка, а ключ объекта в S3-хранилище: biometrics/<uuid4>.jpg (формат закреплен CHECK'ом ck_student_photos_photo_key_format).
 created_at (DateTime) — Дата загрузки (полезно для обновления базы лиц).
 
 4. disciplines. Закрывает требование — ведение журнала по схеме «Один журнал - одна дисциплина».
@@ -73,8 +73,8 @@ edited_at (DateTime, Nullable) — Когда преподаватель вне�
 6 пара 17:20-18:50
 7 пара 19:00-20:30
 
-# Как поднять БД
-Docker: хранилище и backend живут в контейнерах, распознавание лиц - нативным процессом Windows (GPU и камера).
+# Как поднять окружение
+Docker: БД, S3-хранилище и backend живут в контейнерах, распознавание лиц - нативным процессом Windows (GPU и камера).
 
 ## Первый запуск
 ```
@@ -82,23 +82,49 @@ cp .env.example .env
 docker compose up -d
 docker compose run --rm backend alembic upgrade head
 docker compose run --rm backend python -m db.seeds
+docker compose run --rm backend uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
+- API: http://127.0.0.1:8000 (Swagger: http://127.0.0.1:8000/docs)
 - PostgreSQL: 127.0.0.1:5433
 - pgAdmin 4: http://127.0.0.1:5050 (логин/пароль - в .env)
+- S3-хранилище (SeaweedFS): http://127.0.0.1:8333 - internal-порты наружу не публикуются
+
+Бакеты biometrics и frames создаёт само приложение при старте (app.services.storage.ensure_buckets) и включает в них версионирование - отдельного шага провижининга нет.
 
 ## Команды
 ```
-docker compose ps                  # состояние сервисов
-docker compose logs -f db         # логи БД
+docker compose ps                                              # состояние сервисов
+docker compose logs -f db                                      # логи БД
+docker compose logs -f storage                                 # логи хранилища
 docker compose run --rm backend alembic current
+docker compose run --rm backend python -m db.seeds
+docker compose exec backend python -m pytest tests -q          # тесты (в контейнере)
 docker compose exec db psql -U studentcv -d studentcv
-docker compose down               # остановить (данные сохранятся)
-docker compose down -v            # ВНИМАНИЕ: удалить и БД, и volume с данными
+docker compose down                                            # остановить (данные сохранятся)
+docker compose down -v                                         # ВНИМАНИЕ: удалить volume с БД И с хранилищем
 ```
 
-## Бэкап
+# Правила посещаемости
+Как событие распознавания превращается в статус (договорённость 10.11.2026). Границы считаются от даты и времени пары (lessons.lesson_date + start_time/end_time):
+
+| Время прохода | Результат |
+| --- | --- |
+| раньше начала пары | PRESENT, delay_minutes = NULL |
+| ровно в начало пары | LATE, delay_minutes = 0 |
+| позже начала, но раньше конца | LATE, delay_minutes = округление вверх |
+| не раньше конца пары | событие НЕ записывается, студент остаётся ABSENT |
+
+- При повторной доставке по одной паре побеждает самое РАННЕЕ время входа: более позднее событие не перебивает записанное (UNIQUE student_id + lesson_id, дублей нет).
+- Запись с is_manually_edited = TRUE автоматическим событием не меняется: правка преподавателя важнее кадра.
+- Отсутствие строки = ABSENT. Отдельного статуса "пришёл после конца пары" нет, и по данным журнала эти два случая неразличимы (вопрос заказчику, см. «План. База данных и ORM.md» §9).
+
+# Бэкап
+Данных ДВА: строки в PostgreSQL и объекты в S3-хранилище. Ключи фото хранит база, поэтому резервные копии снимаются и восстанавливаются только парой.
 ```
-powershell -ExecutionPolicy Bypass -File scripts\backup.ps1
+powershell -ExecutionPolicy Bypass -File scripts\backup.ps1           # база -> ./backups/*.dump
+powershell -ExecutionPolicy Bypass -File scripts\backup_storage.ps1   # объекты -> ./backups/storage-<stamp>/
+powershell -ExecutionPolicy Bypass -File scripts\restore.ps1          # восстановить базу
+powershell -ExecutionPolicy Bypass -File scripts\restore_storage.ps1  # восстановить объекты
+powershell -ExecutionPolicy Bypass -File scripts\restore_storage.ps1 -VerifyOnly  # проверить дампа на целостность, не трогая хранилище
 ```
-Дампы складываются в ./backups (ротация 10 последних). Восстановление - scripts\restore.ps1.
-Данные лежат в volume pgdata и не переносятся копированием папки - только дампом.
+pgdata - volume, данные не переносятся копированием папки: только дампом. Восстановление хранилища раскладывает объекты файлами по бакетам и сверяет sha256 каждого.
