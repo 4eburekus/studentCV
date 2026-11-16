@@ -41,9 +41,14 @@ class AttendanceRead(BaseModel):
     id: int
     student_id: int
     lesson_id: int
-    entry_time: datetime
+    # None у ABSENT: времени входа не было. Схема обязана это пропускать, иначе
+    # первая же ABSENT-строка в журнале дала бы ValidationError и HTTP 500.
+    entry_time: datetime | None = None
     status: AttendanceStatus
     delay_minutes: int | None = None
+    # Адрес доказательного снимка того входа, который здесь засчитан. None у
+    # ABSENT от закрытия пары (события не было) и у строк до этой правки.
+    frame_object_key: str | None = None
     is_manually_edited: bool
     created_at: datetime
 
@@ -62,7 +67,8 @@ class AttendanceEventResult(BaseModel):
             "recorded - создана или обновлена запись; "
             "kept_earlier_entry - оставлен более ранний вход; "
             "kept_manual_edit - запись правили руками, не трогали; "
-            "ignored_after_lesson_end - вход после конца пары, строки нет"
+            "ignored_after_lesson_end - вход после конца пары, отметка "
+            "о посещении не ставится (строка может быть ABSENT от закрытия)"
         )
     )
     lesson_start: time | None = Field(
@@ -78,9 +84,15 @@ class JournalEntry(BaseModel):
     student_id: int
     full_name: str
     group_number: str
-    entry_time: datetime
+    entry_time: datetime | None = None
     status: AttendanceStatus
     delay_minutes: int | None = None
+    # Признак ручной правки в журнале обязателен: преподаватель должен видеть,
+    # какая отметка поставлена руками, а какая пришла с камеры.
+    is_manually_edited: bool = False
+    # Ключ кадра в журнале нужен ровно для одного: открыть снимок у спорной
+    # отметки перед тем, как править её руками (задача 3.3.1).
+    frame_object_key: str | None = None
 
 
 class Journal(BaseModel):
@@ -88,9 +100,43 @@ class Journal(BaseModel):
     discipline_name: str
     lesson_date: str
     start_time: str
+    group_number: str = Field(
+        description="Группа, для которой пара: из неё считается состав журнала"
+    )
     end_time: str = Field(
         description="Конец пары: по нему журнал отличает опоздавших от "
         "тех, кто пришёл слишком поздно и не учтён"
     )
+    closed_at: str | None = Field(
+        default=None,
+        description="Момент закрытия пары (когда проставлены ABSENT); "
+        "None - пара ещё не закрыта",
+    )
     entries: list[JournalEntry]
     total: int
+
+
+class LessonClosure(BaseModel):
+    """Ответ кнопки «завершить пару».
+
+    Числа, а не сообщение: фронт собирает из них текст «проставлено N
+    отсутствий», а тесты проверяют суть. Повторный вызов возвращает тот же
+    lesson_id с absent_created=0 и was_already_closed=true - это не сбой,
+    а идемпотентность.
+    """
+
+    lesson_id: int
+    group_number: str = Field(
+        description="Группа, составу которой проставлены отсутствия"
+    )
+    absent_created: int = Field(
+        description="Сколько ABSENT-строк создано этим вызовом (повтор - 0)"
+    )
+    already_recorded: int = Field(
+        default=0,
+        description="Сколько студентов уже имели отметку о посещении до закрытия",
+    )
+    closed_at: datetime = Field(description="Момент закрытия пары")
+    was_already_closed: bool = Field(
+        description="True, если пара была закрыта раньше этого вызова"
+    )

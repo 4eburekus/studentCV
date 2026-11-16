@@ -116,37 +116,51 @@ def next_monday(today: date) -> date:
     return today + timedelta(days=(7 - today.weekday()) % 7)
 
 
+def groups_in_students() -> list[str]:
+    """Группы демо-студентов в порядке объявления, без повторов."""
+    return list(dict.fromkeys(group_number for _, group_number in STUDENTS))
+
+
 async def get_or_create_lessons(
     session: AsyncSession, discipline: Discipline
 ) -> list[Lesson]:
-    """Пары на учебную неделю: 7 слотов в понедельник, 5 - во вторник."""
+    """Пары на учебную неделю: 7 слотов в понедельник, 5 - во вторник.
+
+    Каждая группа получает ОДИНАКОВОЕ расписание. Это не лень, а демонстрация:
+    одна дисциплина в один слот у двух групп стала возможной только после того,
+    как группа вошла в UNIQUE ключ пары; со старым ключом вторая группа давала
+    IntegrityError.
+    """
     monday = next_monday(date.today())
     lessons: list[Lesson] = []
 
-    for day_offset, slot_indexes in ((0, range(0, 7)), (1, range(0, 5))):
-        lesson_date = monday + timedelta(days=day_offset)
-        for slot_index in slot_indexes:
-            start_time, end_time = LESSON_SLOTS[slot_index]
-            lesson = await session.scalar(
-                select(Lesson).where(
-                    Lesson.discipline_id == discipline.id,
-                    Lesson.lesson_date == lesson_date,
-                    Lesson.start_time == start_time,
+    for group_number in groups_in_students():
+        for day_offset, slot_indexes in ((0, range(0, 7)), (1, range(0, 5))):
+            lesson_date = monday + timedelta(days=day_offset)
+            for slot_index in slot_indexes:
+                start_time, end_time = LESSON_SLOTS[slot_index]
+                lesson = await session.scalar(
+                    select(Lesson).where(
+                        Lesson.discipline_id == discipline.id,
+                        Lesson.group_number == group_number,
+                        Lesson.lesson_date == lesson_date,
+                        Lesson.start_time == start_time,
+                    )
                 )
-            )
-            if lesson is None:
-                lesson = Lesson(
-                    discipline_id=discipline.id,
-                    lesson_date=lesson_date,
-                    start_time=start_time,
-                    end_time=end_time,
-                )
-                session.add(lesson)
-                await session.flush()
-                print("created lesson:", lesson_date, start_time)
-            else:
-                print("lesson exists:", lesson_date, start_time)
-            lessons.append(lesson)
+                if lesson is None:
+                    lesson = Lesson(
+                        discipline_id=discipline.id,
+                        group_number=group_number,
+                        lesson_date=lesson_date,
+                        start_time=start_time,
+                        end_time=end_time,
+                    )
+                    session.add(lesson)
+                    await session.flush()
+                    print("created lesson:", group_number, lesson_date, start_time)
+                else:
+                    print("lesson exists:", group_number, lesson_date, start_time)
+                lessons.append(lesson)
     return lessons
 
 
@@ -155,16 +169,36 @@ async def get_or_create_attendance(
     students: list[Student],
     lessons: list[Lesson],
 ) -> None:
-    """Несколько записей журнала, включая случай LATE с delay_minutes."""
+    """Несколько записей журнала, включая случай LATE с delay_minutes.
+
+    Пару берём ТОЛЬКО своей группы: после того как ABSENT стал записью,
+    запись чужой группы означала бы «студент сходил на пару, которой у него
+    нет», и закрытие такой пары никогда бы её не поправило.
+    """
     if not students or not lessons:
         return
 
-    entries = [
-        # (студент, пара, статус, минуты опоздания)
-        (students[0], lessons[0], AttendanceStatus.PRESENT, None),
-        (students[1], lessons[0], AttendanceStatus.LATE, 12),
-        (students[2], lessons[1], AttendanceStatus.PRESENT, None),
-    ]
+    def first_lessons_of(group_number: str) -> list[Lesson]:
+        return [lesson for lesson in lessons if lesson.group_number == group_number]
+
+    own: dict[str, list[Lesson]] = {
+        group: first_lessons_of(group) for group in groups_in_students()
+    }
+
+    entries = []
+    for student, index, status, delay in (
+        (students[0], 0, AttendanceStatus.PRESENT, None),
+        (students[1], 0, AttendanceStatus.LATE, 12),
+        (students[2], 1, AttendanceStatus.PRESENT, None),
+    ):
+        group_lessons = own.get(student.group_number) or []
+        if index >= len(group_lessons):
+            continue
+        entries.append((student, group_lessons[index], status, delay))
+
+    if not entries:
+        print("attendance skipped: no lessons for the seeded groups")
+        return
 
     for student, lesson, status, delay in entries:
         record = await session.scalar(

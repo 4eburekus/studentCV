@@ -25,6 +25,7 @@ import aioboto3
 from botocore.exceptions import BotoCoreError, ClientError
 
 from app.core.config import Settings, get_settings
+from db.models import FRAME_KEY_REGEX
 
 
 class ObjectNotFound(Exception):
@@ -107,14 +108,11 @@ def new_frame_key(lesson_id: int) -> str:
     return f"{FRAMES_KEY_PREFIX}/{lesson_id}/{uuid.uuid4()}.jpg"
 
 
-# Формат ключа кадра. Единственный источник - этот модуль: он же генерирует
-# ключ (new_frame_key), он же проверяет приходящий из CV-процесса. В БД ключ
-# не хранится, CHECK на него невозможен, поэтому в db/models.py его нет
-# намеренно - вторая копия схемы всегда разъезжается с первой.
-FRAME_KEY_RE = re.compile(
-    r"^frames/[0-9]+/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}"
-    r"-[0-9a-f]{4}-[0-9a-f]{12}\.jpg$"
-)
+# Формат ключа кадра. Текст контракта объявлен в db/models.py
+# (FRAME_KEY_REGEX) и устроен так же, как PHOTO_KEY_REGEX: тот же текст
+# описывает и CHECK в БД, и проверку на входе, потому что два описания одного
+# контракта неизбежно разъезжаются. Здесь остаётся только валидатор.
+FRAME_KEY_RE = re.compile(FRAME_KEY_REGEX)
 
 
 def is_frame_key(key: str) -> bool:

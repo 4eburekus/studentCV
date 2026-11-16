@@ -3,6 +3,7 @@
 Здесь нет бизнес-логики и нет эндпоинтов - только сборка приложения.
 """
 
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -11,6 +12,7 @@ from fastapi import FastAPI
 from app.api.endpoints import health
 from app.api.router import api_router
 from app.core.config import get_settings, validate_settings
+from app.services.lesson_closer import close_overdue_loop
 from db.session import dispose_engine
 
 
@@ -40,9 +42,30 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     except Exception as exc:  # noqa: BLE001: старт не должен падать из-за хранилища
         app.state.storage_warnings = [f"provisioning skipped: {type(exc).__name__}: {exc}"]
 
+    # Фоновое закрытие пар. Отказывается подниматься, если переменная
+    # выключена (тесты, отладка журнала) - см. LESSON_CLOSE_ENABLED.
+    stop_closer = asyncio.Event()
+    closer_task: asyncio.Task | None = None
+    if settings.lesson_close_enabled:
+        closer_task = asyncio.create_task(
+            close_overdue_loop(stop_closer, settings.lesson_close_interval_seconds),
+            name="lesson-closer",
+        )
+        app.state.closer_task = closer_task
+    app.state.closer_stopped = stop_closer
+
     try:
         yield
     finally:
+        # Сначала сигналим фону и ждём его, и только потом гасим пул БД:
+        # закрытие ходит в базу, и ронять пул под ним нельзя.
+        stop_closer.set()
+        if closer_task is not None:
+            closer_task.cancel()
+            try:
+                await closer_task
+            except asyncio.CancelledError:
+                pass
         await dispose_engine()
 
 

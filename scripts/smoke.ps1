@@ -107,6 +107,10 @@ $lowerGroup = "01-" + [char]0x0444 + [char]0x0438 + [char]0x0438 + [char]0x0442 
 $shortGroup = "01-" + [char]0x0424 + [char]0x0418 + [char]0x0442 + [char]0x0442 + "-01"
 # Dedicated group for the cascade test, so it does not touch attendance rows
 $cascadeGroup = "09-" + [char]0x0426 + [char]0x041A + [char]0x0410 + [char]0x0446 + [char]0x0446 + "-09"
+# Group for the ABSENT / frame-key checks: lessons since 0003 belong to a group,
+# and auto-close writes ABSENT rows for every active student of that group, so
+# these checks need a group of their own that nothing else touches.
+$absentGroup = "08-" + [char]0x0410 + [char]0x0411 + [char]0x0412 + [char]0x0433 + [char]0x0435 + "-08"
 # Valid photo object key: biometrics/<uuid4>.jpg (format enforced by CHECK).
 $photoKey = "biometrics/" + [guid]::NewGuid().ToString().ToLower() + ".jpg"
 
@@ -147,13 +151,14 @@ Assert-SqlOk "create test discipline and lesson" @"
 insert into disciplines (name, teacher_id)
 select 'Smoke Discipline', id from teachers order by id limit 1;
 
-insert into lessons (discipline_id, lesson_date, start_time, end_time)
-select d.id, current_date + 60, time '08:30', time '10:00'
+insert into lessons (discipline_id, group_number, lesson_date, start_time, end_time)
+select d.id, '$validGroup', current_date + 60, time '08:30', time '10:00'
 from disciplines d
 where d.name = 'Smoke Discipline'
   and not exists (
       select 1 from lessons l
       where l.discipline_id = d.id
+        and l.group_number = '$validGroup'
         and l.lesson_date = current_date + 60
         and l.start_time = time '08:30'
   );
@@ -240,8 +245,8 @@ else {
 
 # --- 5. lesson time CHECK ----------------------------------------------------
 Assert-SqlFails "reject lesson with end_time <= start_time" @"
-insert into lessons (discipline_id, lesson_date, start_time, end_time)
-select d.id, current_date + 90, time '10:00', time '09:00'
+insert into lessons (discipline_id, group_number, lesson_date, start_time, end_time)
+select d.id, '$validGroup', current_date + 90, time '10:00', time '09:00'
 from disciplines d
 where d.name = 'Smoke Discipline'
 limit 1;
@@ -262,6 +267,130 @@ from students where group_number = '$validGroup' limit 1;
 
 delete from student_photos where photo_url = '$photoKey';
 "@
+
+# --- 7. ABSENT as a row, not as a missing row (0003) ---------------------------
+# Checks below use their own group and a lesson 120 days ahead: the backend runs
+# a scheduler that closes overdue lessons, so anything touching a past pair
+# would change underneath the script while it is running.
+#
+# Every negative check deletes first. Without that an "insert ... where not
+# exists" matching zero rows exits 0 without ever reaching the CHECK, which
+# turns a real regression into a false PASS.
+
+Assert-SqlOk "create lesson for the absent group" @"
+insert into lessons (discipline_id, group_number, lesson_date, start_time, end_time)
+select d.id, '$absentGroup', current_date + 120, time '08:30', time '10:00'
+from disciplines d
+where d.name = 'Smoke Discipline'
+  and not exists (
+      select 1 from lessons l
+      where l.discipline_id = d.id
+        and l.group_number = '$absentGroup'
+        and l.lesson_date = current_date + 120
+  );
+"@
+
+Assert-SqlOk "insert student into the absent group" @"
+insert into students (full_name, group_number)
+select 'Smoke Absent Student', '$absentGroup'
+where not exists (
+    select 1 from students where group_number = '$absentGroup'
+);
+"@
+
+Assert-SqlOk "accept ABSENT row without entry_time" @"
+delete from attendance_records ar using students s
+where ar.student_id = s.id and s.group_number = '$absentGroup';
+
+insert into attendance_records (student_id, lesson_id, entry_time, status)
+select s.id, l.id, null, 'ABSENT'
+from students s, lessons l
+where s.group_number = '$absentGroup'
+  and l.group_number = '$absentGroup'
+  and l.lesson_date = current_date + 120;
+"@
+
+Assert-SqlFails "reject ABSENT row that carries entry_time" @"
+delete from attendance_records ar using students s
+where ar.student_id = s.id and s.group_number = '$absentGroup';
+
+insert into attendance_records (student_id, lesson_id, entry_time, status)
+select s.id, l.id, (current_date + 120) + time '09:00', 'ABSENT'
+from students s, lessons l
+where s.group_number = '$absentGroup'
+  and l.group_number = '$absentGroup'
+  and l.lesson_date = current_date + 120;
+"@ 'ck_attendance_records_absent_iff_no_entry_time'
+
+# --- 8. the frame key stored on the row (0003) ---------------------------------
+Assert-SqlOk "accept PRESENT row with a frame key" @"
+delete from attendance_records ar using students s
+where ar.student_id = s.id and s.group_number = '$absentGroup';
+
+insert into attendance_records (student_id, lesson_id, entry_time, status, frame_object_key)
+select s.id, l.id, (current_date + 120) + time '08:35', 'PRESENT',
+       'frames/' || l.id || '/' || gen_random_uuid() || '.jpg'
+from students s, lessons l
+where s.group_number = '$absentGroup'
+  and l.group_number = '$absentGroup'
+  and l.lesson_date = current_date + 120;
+"@
+
+Assert-SqlFails "reject a frame key outside frames/<lesson>/<uuid4>.jpg" @"
+delete from attendance_records ar using students s
+where ar.student_id = s.id and s.group_number = '$absentGroup';
+
+insert into attendance_records (student_id, lesson_id, entry_time, status, frame_object_key)
+select s.id, l.id, (current_date + 120) + time '08:35', 'PRESENT', 'frames/not-a-uuid.jpg'
+from students s, lessons l
+where s.group_number = '$absentGroup'
+  and l.group_number = '$absentGroup'
+  and l.lesson_date = current_date + 120;
+"@ 'ck_attendance_records_frame_key_format'
+
+# A trace belongs to a counted entry. This is what stops the auto-close from
+# inventing a photo for a student who never came to the camera.
+Assert-SqlFails "reject a frame key on a row without entry_time" @"
+delete from attendance_records ar using students s
+where ar.student_id = s.id and s.group_number = '$absentGroup';
+
+insert into attendance_records (student_id, lesson_id, entry_time, status, frame_object_key)
+select s.id, l.id, null, 'ABSENT',
+       'frames/' || l.id || '/' || gen_random_uuid() || '.jpg'
+from students s, lessons l
+where s.group_number = '$absentGroup'
+  and l.group_number = '$absentGroup'
+  and l.lesson_date = current_date + 120;
+"@ 'ck_attendance_records_frame_key_requires_entry'
+
+# --- 9. lesson belongs to a group; the group is part of the slot key (0003) -----
+Assert-SqlFails "reject a lesson whose group number has a bad format" @"
+insert into lessons (discipline_id, group_number, lesson_date, start_time, end_time)
+select d.id, '$lowerGroup', current_date + 121, time '08:30', time '10:00'
+from disciplines d
+where d.name = 'Smoke Discipline'
+limit 1;
+"@ 'ck_lessons_group_number_format'
+
+# Two groups in one slot are exactly what the new key allows.
+Assert-SqlOk "accept the same discipline and slot for another group" @"
+delete from lessons
+where group_number = '$cascadeGroup' and lesson_date = current_date + 120;
+
+insert into lessons (discipline_id, group_number, lesson_date, start_time, end_time)
+select d.id, '$cascadeGroup', current_date + 120, time '08:30', time '10:00'
+from disciplines d
+where d.name = 'Smoke Discipline'
+limit 1;
+"@
+
+Assert-SqlFails "reject the same group twice in one slot" @"
+insert into lessons (discipline_id, group_number, lesson_date, start_time, end_time)
+select d.id, '$cascadeGroup', current_date + 120, time '08:30', time '10:00'
+from disciplines d
+where d.name = 'Smoke Discipline'
+limit 1;
+"@ 'uq_lessons_discipline_group_date_start'
 
 Write-Host ""
 if ($script:Failures -eq 0) {

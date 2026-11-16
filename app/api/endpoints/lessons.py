@@ -16,6 +16,13 @@ router = APIRouter()
 async def list_lessons(
     discipline_id: int | None = Query(None, ge=1),
     date_: date | None = Query(None, alias="date"),
+    group_number: str | None = Query(
+        None,
+        min_length=4,
+        max_length=20,
+        description="Пары только этой группы: без фильтра в одну простыню "
+        "смешаются пары разных групп в одном и том же слоте",
+    ),
     page: Pagination = Depends(pagination_params),
     session: AsyncSession = Depends(get_session),
 ) -> schemas.LessonList:
@@ -23,6 +30,7 @@ async def list_lessons(
         session,
         discipline_id=discipline_id,
         lesson_date=date_,
+        group_number=group_number,
         offset=page.offset,
         limit=page.limit,
     )
@@ -31,9 +39,11 @@ async def list_lessons(
             id=lesson.id,
             discipline_id=lesson.discipline_id,
             discipline_name=name,
+            group_number=lesson.group_number,
             lesson_date=lesson.lesson_date,
             start_time=lesson.start_time,
             end_time=lesson.end_time,
+            closed_at=lesson.closed_at,
         )
         for lesson, name in rows
     ]

@@ -65,6 +65,18 @@ class Settings(BaseSettings):
     min_photos: int = Field(default=1, alias="MIN_PHOTOS")
     max_photos: int = Field(default=5, alias="MAX_PHOTOS")
 
+    # --- Фоновое закрытие пар --------------------------------------------------
+    # ABSENT проставляется автоматически, без нажатия кнопки: см.
+    # app/services/lesson_closer. Выключается переменной для тестов и для
+    # отладки журнала на известных данных: с включённым планировщиком журнал
+    # истёкшей пары меняется между запросами.
+    lesson_close_enabled: bool = Field(default=True, alias="LESSON_CLOSE_ENABLED")
+    lesson_close_interval_seconds: int = Field(
+        default=60,
+        alias="LESSON_CLOSE_INTERVAL_SECONDS",
+        description="Как часто проверять истёкшие незакрытые пары",
+    )
+
 
 @lru_cache
 def get_settings() -> Settings:

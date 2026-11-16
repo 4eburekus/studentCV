@@ -84,6 +84,42 @@ async def register_event(
     )
 
 
+@router.post(
+    "/lessons/{lesson_id}/close",
+    response_model=schemas.LessonClosure,
+    responses=merge(R404, R503),
+)
+async def close_lesson(
+    lesson_id: int,
+    session: AsyncSession = Depends(get_session),
+) -> schemas.LessonClosure:
+    """Завершить пару: проставить ABSENT активным студентам группы без отметки.
+
+    Это кнопка на фронте, и она зовёт ровно ту же функцию, что и планировщик,
+    поэтому два пути не могут разойтись. Операция идемпотентна: повторный
+    вызов создаст 0 строк и ничего не испортит. Пару можно закрыть досрочно -
+    это самолечится: студент, помеченный ABSENT, а потом замеченный камерой,
+    перезапишет свою строку, потому что закрытие только добавляет записи,
+    но не меняет существующие.
+
+    200 всегда, в том числе при повторе: результат тот же, а 409 заставил бы
+    фронт обрабатывать «уже закрыто» как сбой.
+    """
+    try:
+        report = await attendance_service.close_lesson(session, lesson_id)
+    except attendance_service.LessonNotFound as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+
+    return schemas.LessonClosure(
+        lesson_id=report.lesson_id,
+        group_number=report.group_number,
+        absent_created=report.absent_created,
+        already_recorded=report.already_recorded,
+        closed_at=report.closed_at,
+        was_already_closed=report.was_already_closed,
+    )
+
+
 @router.get("/journal", response_model=schemas.Journal, responses=merge(R404, R503))
 async def get_journal(
     lesson_id: int = Query(..., ge=1, description="Пара, журнал которой нужен"),
@@ -91,11 +127,11 @@ async def get_journal(
 ) -> schemas.Journal:
     """Журнал пары: кто и во сколько прошёл.
 
-    Отсутствие строки = ABSENT (модель §3.6 плана). Важно для чтения журнала:
-    студент, пришедший ПОСЛЕ конца пары, тоже не имеет строки - по правилам
-    10.11.2026 он не учитывается. Различить эти два случая по одной записи
-    нельзя; вопрос вынесен в §9 плана как вопрос заказчику, потому что ответ
-    меняет схему.
+    Состав журнала определяет закрытие пары: пока пара не закрыта, в журнале
+    только те, кого зафиксировала камера; после закрытия там же лежат и ABSENT.
+    Поэтому у ответа есть closed_at: по нему фронт различает «прогулов ещё нет»
+    и «прогулов нет, потому что все пришли» (см. §9.5 плана - ABSENT теперь
+    отдельная запись, а не отсутствие строки).
     Студенты тянутся одним JOIN в сервисе - без N+1.
     """
     try:
@@ -114,6 +150,8 @@ async def get_journal(
             entry_time=record.entry_time,
             status=record.status,
             delay_minutes=record.delay_minutes,
+            is_manually_edited=record.is_manually_edited,
+            frame_object_key=record.frame_object_key,
         )
         for record, student in pairs
     ]
@@ -123,7 +161,13 @@ async def get_journal(
         discipline_name=discipline_name,
         lesson_date=str(lesson.lesson_date),
         start_time=lesson.start_time.strftime("%H:%M"),
+        group_number=lesson.group_number,
         end_time=lesson.end_time.strftime("%H:%M"),
+        # Формат как у start/end: фронту нужен отображаемый момент, а не
+        # ISO-строка с зоной, которую он будет парсить на своей стороне.
+        closed_at=(
+            lesson.closed_at.strftime("%Y-%m-%d %H:%M") if lesson.closed_at else None
+        ),
         entries=entries,
         total=len(entries),
     )

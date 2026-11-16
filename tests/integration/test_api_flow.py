@@ -260,7 +260,93 @@ def test_wrong_content_type_rejected(client: httpx.Client) -> None:
 # --- посещаемость -------------------------------------------------------------
 
 
-def first_lesson(client: httpx.Client) -> dict:
+def db_call(fn):
+    """Выполнить асинхронную функцию с СОБСТВЕННЫМ движком и своим циклом.
+
+    Тесты ходят в БД напрямую там, где для этого нет эндпоинта (создать пару,
+    поставить флаг ручной правки, проверить констрейнт). Глобальный SessionLocal
+    для этого не годится: asyncio.run создаёт новый цикл на каждый вызов, а пул
+    глобального движка переживает его и отдаёт соединение, присоединённое к
+    закрытому циклу - RuntimeError "attached to a different loop". Ошибка
+    плавающая (зависит от того, был ли пул прогрет в этом процессе), поэтому
+    каждый такой вызов получает движок, который умирает вместе со своим циклом.
+    """
+    import asyncio
+
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+
+    from db.session import DATABASE_URL
+
+    async def main():
+        engine = create_async_engine(DATABASE_URL, pool_size=1, max_overflow=0)
+        try:
+            factory = async_sessionmaker(
+                engine, class_=AsyncSession, expire_on_commit=False
+            )
+            async with factory() as session:
+                return await fn(session)
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(main())
+
+
+def make_lesson_group(client: httpx.Client) -> dict:
+    """Своя пара со СВОЕЙ группой на завтра - фундамент тестов посещаемости.
+
+    Почему нельзя было взять «первую пару из расписания», как делали раньше:
+    ABSENT теперь тоже строка журнала, и планировщик закрывает истёкшие пары.
+    Сидовые пары стоят на текущую учебную неделю, вечером они истекают - и
+    чужой фоновый прогон вставлял бы строки ABSENT в журнал ровно в тот момент,
+    когда тест проверяет «этого студента в журнале нет». Гонка, а не проверка.
+
+    Здесь же пара изолирована дважды:
+    - group_number уникальна, поэтому в состав журнала входит ровно один
+      студент - тот, кого создал этот тест (у сидовых групп десятки студентов
+      из прошлых прогонов);
+    - lesson_date завтрашняя, поэтому пара не может ни истечь, ни быть закрытой
+      ни при каком времени суток - тесты не зависят от часового пояса и от
+      того, когда их запустили.
+
+    Пишем в БД напрямую, а не через API: расписание ведётся отдельным контуром,
+    POST /lessons в этом срезе нет (см. LessonRead в app/schemas/lesson.py).
+    """
+    from datetime import date, time
+
+    from db.models import Lesson
+
+    base = first_lesson_any(client)
+    group = unique_group()
+    lesson_date = date.today() + timedelta(days=1)
+
+    async def create(s) -> int:
+        lesson = Lesson(
+            discipline_id=base["discipline_id"],
+            group_number=group,
+            # Завтра: пара не может истечь ни при каком времени суток, поэтому
+            # фоновое закрытие до неё не доберётся никогда.
+            lesson_date=lesson_date,
+            start_time=time(8, 30),
+            end_time=time(10, 0),
+        )
+        s.add(lesson)
+        await s.commit()
+        return lesson.id
+
+    lesson_id = db_call(create)
+    return {
+        "id": lesson_id,
+        "discipline_id": base["discipline_id"],
+        "group_number": group,
+        "lesson_date": (date.today() + timedelta(days=1)).isoformat(),
+        "start_time": "08:30",
+        "end_time": "10:00",
+        "closed_at": None,
+    }
+
+
+def first_lesson_any(client: httpx.Client) -> dict:
+    """Любая существующая пара - нужна только чтобы взять её дисциплину."""
     r = client.get("/api/v1/lessons", params={"limit": 1})
     assert r.status_code == 200, r.text
     items = r.json()["items"]
@@ -304,8 +390,8 @@ def lesson_span(lesson: dict) -> tuple[datetime, datetime]:
 
 
 def test_event_late_computes_delay(client: httpx.Client) -> None:
-    lesson = first_lesson(client)
-    student = make_student(client)
+    lesson = make_lesson_group(client)
+    student = make_student(client, group=lesson["group_number"])
     key = make_frame_key(lesson["id"])
 
     r = client.post(
@@ -332,8 +418,8 @@ def test_event_repeat_keeps_earlier_entry(client: httpx.Client) -> None:
     Обратный порядок (сначала ранний, потом поздний) проверяется вторым
     запросом ниже: там уже ничего не меняется.
     """
-    lesson = first_lesson(client)
-    student = make_student(client)
+    lesson = make_lesson_group(client)
+    student = make_student(client, group=lesson["group_number"])
     key = make_frame_key(lesson["id"])
 
     first = client.post(
@@ -349,14 +435,17 @@ def test_event_repeat_keeps_earlier_entry(client: httpx.Client) -> None:
     assert first["record"]["status"] == "LATE"
     assert first["record"]["delay_minutes"] == 5
 
-    # Раннее событие (ровно начало) перебивает позднее записанное.
+    # Раннее событие (ровно начало) перебивает позднее записанное. Кадр у него
+    # СВОЙ: вместе со временем входа обязан перезаписаться и его адрес, иначе в
+    # журнале остался бы снимок от более позднего прохода.
+    early_key = make_frame_key(lesson["id"])
     second = client.post(
         "/api/v1/attendance/events",
         json={
             "lesson_id": lesson["id"],
             "student_id": student["id"],
             "captured_at": captured_for(lesson, 0),
-            "frame_object_key": key,
+            "frame_object_key": early_key,
         },
     )
     assert second.status_code == 201, second.text
@@ -366,6 +455,9 @@ def test_event_repeat_keeps_earlier_entry(client: httpx.Client) -> None:
     assert body["record"]["id"] == first["record"]["id"]
     assert body["record"]["status"] == "LATE"
     assert body["record"]["delay_minutes"] == 0
+    assert body["record"]["frame_object_key"] == early_key, (
+        "доказательство обязано соответствовать засчитанному входу"
+    )
 
     # А более позднее событие раннее уже НЕ перебивает.
     third = client.post(
@@ -381,6 +473,8 @@ def test_event_repeat_keeps_earlier_entry(client: httpx.Client) -> None:
     third_body = third.json()
     assert third_body["outcome"] == "kept_earlier_entry"
     assert third_body["record"]["delay_minutes"] == 0
+    # И ключ тоже остался от РАННЕГО входа: поздний кадр не затёрт.
+    assert third_body["record"]["frame_object_key"] == early_key, third_body
 
     journal = client.get(
         "/api/v1/attendance/journal", params={"lesson_id": lesson["id"]}
@@ -394,8 +488,8 @@ def test_event_at_start_time_is_late_zero(client: httpx.Client) -> None:
 
     Прежнее имя и ожидание (PRESENT) закрепляли наше допущение, а не правило.
     """
-    lesson = first_lesson(client)
-    student = make_student(client)
+    lesson = make_lesson_group(client)
+    student = make_student(client, group=lesson["group_number"])
     key = make_frame_key(lesson["id"])
 
     r = client.post(
@@ -416,8 +510,8 @@ def test_event_at_start_time_is_late_zero(client: httpx.Client) -> None:
 
 def test_event_before_start_is_present(client: httpx.Client) -> None:
     """Раньше начала - PRESENT без опоздания (минуты могут быть отрицательны)."""
-    lesson = first_lesson(client)
-    student = make_student(client)
+    lesson = make_lesson_group(client)
+    student = make_student(client, group=lesson["group_number"])
     key = make_frame_key(lesson["id"])
 
     body = client.post(
@@ -439,8 +533,8 @@ def test_event_after_lesson_end_is_not_recorded(client: httpx.Client) -> None:
     Это НЕ ошибка: данные валидны, их сознательно не учитываем, поэтому 200,
     record=None и строки в журнале нет.
     """
-    lesson = first_lesson(client)
-    student = make_student(client)
+    lesson = make_lesson_group(client)
+    student = make_student(client, group=lesson["group_number"])
     key = make_frame_key(lesson["id"])
     _start, end = lesson_span(lesson)
 
@@ -470,8 +564,8 @@ def test_manual_edit_is_not_overwritten(client: httpx.Client) -> None:
     Эндпоинта правки ещё нет, поэтому флаг ставим прямо в БД - ровно так,
     как его поставит будущий редактирующий контур.
     """
-    lesson = first_lesson(client)
-    student = make_student(client)
+    lesson = make_lesson_group(client)
+    student = make_student(client, group=lesson["group_number"])
     key = make_frame_key(lesson["id"])
 
     first = client.post(
@@ -485,23 +579,19 @@ def test_manual_edit_is_not_overwritten(client: httpx.Client) -> None:
     ).json()
     entry_time = first["record"]["entry_time"]
 
-    import asyncio
     from sqlalchemy import text as sa_text
 
-    from db.session import SessionLocal
+    async def mark_manual(s) -> None:
+        await s.execute(
+            sa_text(
+                "update attendance_records set is_manually_edited = true "
+                "where id = :id"
+            ),
+            {"id": first["record"]["id"]},
+        )
+        await s.commit()
 
-    async def mark_manual() -> None:
-        async with SessionLocal() as s:
-            await s.execute(
-                sa_text(
-                    "update attendance_records set is_manually_edited = true "
-                    "where id = :id"
-                ),
-                {"id": first["record"]["id"]},
-            )
-            await s.commit()
-
-    asyncio.run(mark_manual())
+    db_call(mark_manual)
 
     # Ранний вход из камеры - он ВЫГЛЯДТ выгоднее для студента, но ручную
     # отметку не имеет права перебивать.
@@ -522,8 +612,8 @@ def test_manual_edit_is_not_overwritten(client: httpx.Client) -> None:
 
 def test_event_with_missing_frame_rejected(client: httpx.Client) -> None:
     """Кадр - доказательство отметки. Нет объекта - нет записи."""
-    lesson = first_lesson(client)
-    student = make_student(client)
+    lesson = make_lesson_group(client)
+    student = make_student(client, group=lesson["group_number"])
     ghost = f"frames/{lesson['id']}/{uuid.uuid4()}.jpg"
 
     r = client.post(
@@ -540,8 +630,8 @@ def test_event_with_missing_frame_rejected(client: httpx.Client) -> None:
 
 
 def test_event_for_inactive_student_rejected(client: httpx.Client) -> None:
-    lesson = first_lesson(client)
-    student = make_student(client)
+    lesson = make_lesson_group(client)
+    student = make_student(client, group=lesson["group_number"])
     key = make_frame_key(lesson["id"])
     client.delete(f"/api/v1/students/{student['id']}")
 
@@ -563,8 +653,8 @@ def test_event_invalid_frame_key_format(client: httpx.Client) -> None:
     Формат проверяется до обращения к хранилищу, поэтому текст ответа должен
     говорить про формат: иначе причину искали бы в бакете.
     """
-    lesson = first_lesson(client)
-    student = make_student(client)
+    lesson = make_lesson_group(client)
+    student = make_student(client, group=lesson["group_number"])
 
     r = client.post(
         "/api/v1/attendance/events",
@@ -605,7 +695,7 @@ def test_event_bad_group_rejected_before_write(client: httpx.Client) -> None:
 def test_journal_exposes_lesson_window(client: httpx.Client) -> None:
     """Журнал обязан отдавать и конец пары: по нему читатель отличает
     «опоздал» от «пришёл слишком поздно и не учтён»."""
-    lesson = first_lesson(client)
+    lesson = make_lesson_group(client)
     journal = client.get(
         "/api/v1/attendance/journal", params={"lesson_id": lesson["id"]}
     ).json()
@@ -615,9 +705,358 @@ def test_journal_exposes_lesson_window(client: httpx.Client) -> None:
 
 def test_journal_carries_discipline_name(client: httpx.Client) -> None:
     """Раньше имя дисциплины было пустой строкой - фронтенду нечего показать."""
-    lesson = first_lesson(client)
+    lesson = make_lesson_group(client)
     journal = client.get(
         "/api/v1/attendance/journal", params={"lesson_id": lesson["id"]}
     ).json()
     assert journal["discipline_name"], journal
     assert journal["lesson_date"] == lesson["lesson_date"]
+
+
+def test_event_returns_and_stores_frame_key(client: httpx.Client) -> None:
+    """Адрес снимка должен ДОХОДИТЬ до читателя, а не только записываться.
+
+    Смысл колонки ровно один: открыть кадр у спорной отметки перед ручной
+    правкой. Если API её не отдаёт, колонка бесполезна для фронта, и проверка
+    «ключ где-то лежит в базе» этого не поймает - поэтому проверяем и ответ
+    события, и строку журнала.
+    """
+    lesson = make_lesson_group(client)
+    student = make_student(client, group=lesson["group_number"])
+    key = make_frame_key(lesson["id"])
+
+    body = client.post(
+        "/api/v1/attendance/events",
+        json={
+            "lesson_id": lesson["id"],
+            "student_id": student["id"],
+            "captured_at": captured_for(lesson, 7),
+            "frame_object_key": key,
+        },
+    ).json()
+
+    assert body["record"]["frame_object_key"] == key, body
+    assert body["outcome"] == "recorded", body
+
+    entry = journal(client, lesson["id"])["entries"][0]
+    assert entry["frame_object_key"] == key, entry
+    assert entry["status"] == "LATE", entry
+
+
+def test_closed_absent_row_has_no_frame_key(client: httpx.Client) -> None:
+    """У ABSENT от закрытия пары кадра нет - и это проверка на обе стороны.
+
+    Обратный случай (у закрытой пары появился адрес снимка) означал бы, что
+    закрытие выдумало доказательство входа, которого не было.
+    """
+    lesson = make_lesson_group(client)
+    make_student(client, group=lesson["group_number"])
+
+    close(client, lesson["id"])
+
+    entry = journal(client, lesson["id"])["entries"][0]
+    assert entry["status"] == "ABSENT", entry
+    assert entry["frame_object_key"] is None, entry
+    assert entry["entry_time"] is None, entry
+
+
+# --- закрытие пары и ABSENT как запись ----------------------------------------
+#
+# Общий смысл этих проверок: отсутствие студента теперь ВЫРАЖЕНО строкой.
+# До этого «записи нет» значило «не пришёл», и журнал не мог показать состав
+# группы вообще. Поэтому тут проверяются не только статусы, но и то, чего
+# раньше в модели не было: entry_time IS NULL у ABSENT, идемпотентность
+# закрытия и неприкосновенность живой отметки.
+
+
+def close(client: httpx.Client, lesson_id: int) -> dict:
+    """Нажатие кнопки «завершить пару»."""
+    r = client.post(f"/api/v1/attendance/lessons/{lesson_id}/close")
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def journal(client: httpx.Client, lesson_id: int) -> dict:
+    r = client.get("/api/v1/attendance/journal", params={"lesson_id": lesson_id})
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def test_close_creates_absent_rows(client: httpx.Client) -> None:
+    """Закрытие проставляет ABSENT тому, кто не отметился.
+
+    Проверяем суть, а не только код ответа: строка обязана быть именно
+    записью с null-временем входа, иначе «отсутствие» по-прежнему было бы
+    отсутствием строки.
+    """
+    lesson = make_lesson_group(client)
+    student = make_student(client, group=lesson["group_number"])
+
+    before = journal(client, lesson["id"])
+    assert before["entries"] == [], "у новой пары не должно быть записей"
+    assert before["closed_at"] is None
+
+    body = close(client, lesson["id"])
+    assert body["absent_created"] == 1, body
+    assert body["already_recorded"] == 0, body
+    assert body["was_already_closed"] is False, body
+    assert body["group_number"] == lesson["group_number"], body
+
+    after = journal(client, lesson["id"])
+    assert after["total"] == 1, after
+    entry = after["entries"][0]
+    assert entry["status"] == "ABSENT", entry
+    assert entry["entry_time"] is None, entry
+    assert entry["delay_minutes"] is None, entry
+    assert entry["student_id"] == student["id"], entry
+    assert after["closed_at"], "закрытая пара обязана показать момент закрытия"
+
+
+def test_close_is_idempotent(client: httpx.Client) -> None:
+    """Повторное закрытие не удваивает отсутствий и не портит журнал.
+
+    Это опора и на кнопку (двойной клик, запрос повторно), и на планировщик:
+    они вызывают одну функцию, и если бы она была неидемпотентна, журнал
+    набивался бы дублями на каждом тике.
+    """
+    lesson = make_lesson_group(client)
+    make_student(client, group=lesson["group_number"])
+    make_student(client, group=lesson["group_number"])
+
+    first = close(client, lesson["id"])
+    assert first["absent_created"] == 2, first
+
+    second = close(client, lesson["id"])
+    assert second["absent_created"] == 0, second
+    assert second["was_already_closed"] is True, second
+
+    after = journal(client, lesson["id"])
+    assert after["total"] == 2, after
+    assert after["closed_at"] == first["closed_at"] or after["closed_at"], after
+
+
+def test_close_keeps_existing_marks(client: httpx.Client) -> None:
+    """Закрытие только добавляет отсутствующее, но не трогает отметку.
+
+    Без этой гарантии кнопка стирала бы реальные посещения: студент,
+    пришедший вовремя, получил бы ABSENT просто потому, что пару закрыли.
+    """
+    lesson = make_lesson_group(client)
+    student = make_student(client, group=lesson["group_number"])
+    key = make_frame_key(lesson["id"])
+
+    posted = client.post(
+        "/api/v1/attendance/events",
+        json={
+            "lesson_id": lesson["id"],
+            "student_id": student["id"],
+            "captured_at": captured_for(lesson, 5),
+            "frame_object_key": key,
+        },
+    ).json()
+    assert posted["record"]["status"] == "LATE", posted
+
+    body = close(client, lesson["id"])
+    assert body["absent_created"] == 0, body
+    assert body["already_recorded"] == 1, body
+
+    entry = journal(client, lesson["id"])["entries"][0]
+    assert entry["status"] == "LATE", entry
+    assert entry["delay_minutes"] == 5, entry
+    assert entry["entry_time"] is not None, entry
+
+
+def test_absent_is_overwritten_by_earlier_event(client: httpx.Client) -> None:
+    """«Самолечение» ранним событием: ABSENT -> LATE.
+
+    Именно ради этого в upsert добавлена ветка entry_time IS NULL: без неё
+    NULL > captured_at даёт NULL, условие не выполняется, и студента,
+    замеченного камерой ПОСЛЕ случайного раннего закрытия пары, система
+    оставила бы отсутствующим навсегда. Это же делает досрочное нажатие
+    кнопки безопасной операцией.
+    """
+    lesson = make_lesson_group(client)
+    student = make_student(client, group=lesson["group_number"])
+
+    close(client, lesson["id"])
+    assert journal(client, lesson["id"])["entries"][0]["status"] == "ABSENT"
+
+    key = make_frame_key(lesson["id"])
+    result = client.post(
+        "/api/v1/attendance/events",
+        json={
+            "lesson_id": lesson["id"],
+            "student_id": student["id"],
+            "captured_at": captured_for(lesson, 20),
+            "frame_object_key": key,
+        },
+    ).json()
+
+    assert result["outcome"] == "recorded", result
+    entry = journal(client, lesson["id"])["entries"][0]
+    assert entry["status"] == "LATE", entry
+    assert entry["delay_minutes"] == 20, entry
+    assert entry["entry_time"] is not None, entry
+
+
+def test_close_skips_inactive_students(client: httpx.Client) -> None:
+    """Отчисленный не появляется в журнале как прогульщик (требование №6).
+
+    Закрытие берёт только is_active = true. Проверка на несуществующем
+    студенте была бы декоративной, поэтому сначала убеждаемся, что строки
+    действительно нет.
+    """
+    lesson = make_lesson_group(client)
+    active = make_student(client, group=lesson["group_number"])
+    inactive = make_student(client, group=lesson["group_number"])
+
+    r = client.delete(f"/api/v1/students/{inactive['id']}")
+    assert r.status_code == 204, r.text
+
+    body = close(client, lesson["id"])
+    assert body["absent_created"] == 1, body
+
+    ids = {e["student_id"] for e in journal(client, lesson["id"])["entries"]}
+    assert ids == {active["id"]}, ids
+
+
+def test_close_unknown_lesson_404(client: httpx.Client) -> None:
+    r = client.post("/api/v1/attendance/lessons/999999/close")
+    assert r.status_code == 404, r.text
+
+
+def test_journal_of_open_lesson_has_no_absent(client: httpx.Client) -> None:
+    """Пока пара не закрыта, отсутствующих в журнале нет - это осознанно.
+
+    Иначе журнал врал бы в разгар пары: опоздавший ещё не отмечен, а ABSENT
+    уже стоит. Различить «ещё идёт» и «все пришли» фронт может по closed_at.
+    """
+    lesson = make_lesson_group(client)
+    make_student(client, group=lesson["group_number"])
+
+    body = journal(client, lesson["id"])
+    assert body["entries"] == [], body
+    assert body["closed_at"] is None
+
+
+def test_schedule_exposes_group_and_closed_at(client: httpx.Client) -> None:
+    """Расписание отдаёт группу и момент закрытия: без них кнопка бесполезна.
+
+    Наличие строк ABSENT про закрытие не говорит - на пару могли прийти все,
+    поэтому closed_at и есть единственный корректный признак.
+    """
+    lesson = make_lesson_group(client)
+    close(client, lesson["id"])
+
+    items = client.get(
+        "/api/v1/lessons", params={"group_number": lesson["group_number"]}
+    ).json()["items"]
+    assert len(items) == 1, items
+    assert items[0]["group_number"] == lesson["group_number"], items
+    assert items[0]["closed_at"], items
+
+
+def test_schedule_filter_by_group_isolates_lessons(client: httpx.Client) -> None:
+    """Фильтр по группе различает параллельные пары одной дисциплины.
+
+    Это ровно то, что стало возможным после входа группы в ключ пары: две
+    группы в одном слоте больше не коллизия.
+    """
+    a = make_lesson_group(client)
+    b = make_lesson_group(client)
+    assert a["start_time"] == b["start_time"], "слоты должны совпадать по построению"
+    assert a["id"] != b["id"], (a, b)
+
+    only_a = client.get(
+        "/api/v1/lessons", params={"group_number": a["group_number"]}
+    ).json()["items"]
+    assert [i["id"] for i in only_a] == [a["id"]], only_a
+
+
+def test_same_slot_same_group_rejected(client: httpx.Client) -> None:
+    """Две пары одной группы в один слот невозможны - ключ по-прежнему защищает.
+
+    Группа добавлена в UNIQUE, а не заменила его: дисциплина + группа + дата +
+    время обязаны быть уникальны вместе.
+    """
+    from datetime import date, time
+
+    from sqlalchemy.exc import IntegrityError
+
+    from db.models import Lesson
+
+    lesson = make_lesson_group(client)
+
+    async def duplicate(s) -> None:
+        base = await s.get(Lesson, lesson["id"])
+        s.add(
+            Lesson(
+                discipline_id=base.discipline_id,
+                group_number=base.group_number,
+                lesson_date=base.lesson_date,
+                start_time=base.start_time,
+                end_time=base.end_time,
+            )
+        )
+        with pytest.raises(IntegrityError):
+            await s.commit()
+
+    db_call(duplicate)
+
+
+def test_absent_requires_null_entry_time(client: httpx.Client) -> None:
+    """CHECK связывает статус и время входа в обе стороны.
+
+    Без него абстрактно можно было бы записать «отсутствовал, но вошёл в
+    09:15» - журнал начал бы противоречить сам себе. Проверяем прямым SQL,
+    потому что ни один эндпоинт такой строку не создаёт: нарушение констрейнта
+    тестируется на том уровне, где он живёт.
+    """
+    from sqlalchemy.exc import DBAPIError
+    from sqlalchemy import text as sa_text
+
+    lesson = make_lesson_group(client)
+    # Студент на каждую попытка ОБЯЗАТЕЛЬНО свой: UNIQUE (student_id, lesson_id)
+    # иначе отклонил бы вторую и третью вставки раньше, чем до очередь дошла до
+    # CHECK, и проверка «констрейнт работает» проходила бы по неверной причине.
+    ids = [make_student(client, group=lesson["group_number"])["id"] for _ in range(3)]
+    # 09:00 - ПОСЛЕ начала пары (08:30): иначе вставка упала бы на CHECK
+    # «entry_time не раньше начала занятия», и проверка CHECK статуса
+    # проходила бы по неверной причине.
+    entry_time = f"{lesson['lesson_date']}T09:00:00+00:00"
+
+    attempts = [
+        ("ABSENT", None, ids[0]),
+        ("ABSENT", entry_time, ids[1]),
+        ("PRESENT", None, ids[2]),
+    ]
+
+    async def run_attempts(s) -> list[bool]:
+        results: list[bool] = []
+        for status, entry, student_id in attempts:
+            try:
+                await s.execute(
+                    sa_text(
+                        "insert into attendance_records "
+                        "(student_id, lesson_id, entry_time, status, "
+                        " delay_minutes, is_manually_edited) "
+                        "values (:st, :le, :et, :stt, null, false)"
+                    ),
+                    {
+                        "st": student_id,
+                        "le": lesson["id"],
+                        "et": entry,
+                        "stt": status,
+                    },
+                )
+                await s.rollback()
+                results.append(True)
+            except DBAPIError:
+                await s.rollback()
+                results.append(False)
+        return results
+
+    ok_absent, bad_absent, bad_present = db_call(run_attempts)
+    assert ok_absent, "ABSENT без времени входа - единственная корректная форма"
+    assert not bad_absent, "ABSENT с временем входа обязан нарушать CHECK"
+    assert not bad_present, "PRESENT без времени входа обязан нарушать CHECK"

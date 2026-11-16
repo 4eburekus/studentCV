@@ -42,12 +42,17 @@ PHOTO_KEY_REGEX = (
     r"-[0-9a-f]{4}-[0-9a-f]{12}\.jpg$"
 )
 
-# Ключ доказательного кадра задаёт НЕ модель, а app/services/storage.py:
-# new_frame_key() - единственная точка генерации, FRAME_KEY_RE - валидатор на
-# входе. В БД ключ кадра не хранится и CHECK на него невозможен, поэтому
-# дублировать схему здесь смысла нет: два описания одного контракта
-# неизбежно разъезжаются (правило, которое мы уже проходили на regex номера
-# группы).
+# Формат ключа доказательного кадра в бакете frames:
+# frames/<lesson_id>/<uuid4>.jpg.
+#
+# Текст контракта живёт здесь - так же, как PHOTO_KEY_REGEX выше: два
+# описания одного контракта неизбежно разъезжаются. App/services/storage.py
+# компилирует из этой строки валидатор FRAME_KEY_RE, поэтому генерация,
+# входящая проверка и CHECK в БД опираются на одно и то же описание.
+FRAME_KEY_REGEX = (
+    r"^frames/[0-9]+/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}"
+    r"-[0-9a-f]{4}-[0-9a-f]{12}\.jpg$"
+)
 
 
 class TimestampMixin:
@@ -176,16 +181,32 @@ class Discipline(Base, TimestampMixin):
 
 
 class Lesson(Base, TimestampMixin):
-    """Пара: база для расчета опозданий."""
+    """Пара: база для расчета опозданий.
+
+    group_number - группа, для которой эта пара. Это то, чего в схеме не
+    хватало, чтобы ABSENT стал записью: состав журнала задаёт не набор
+    пришедших, а набор ДОЛЖНЫХ быть, и известен он только из пары.
+    Формат номера проверяется тем же regex, что и у students (см. шапку).
+
+    closed_at - момент, когда пара закрыта и отсутствующим проставлен ABSENT
+    (планировщиком или кнопкой «завершить пару»). NULL - закрытия ещё не было.
+    """
 
     __tablename__ = "lessons"
     __table_args__ = (
         CheckConstraint("end_time > start_time", name="end_after_start"),
+        CheckConstraint(
+            f"group_number ~ '{GROUP_NUMBER_REGEX}'",
+            name="group_number_format",
+        ),
+        # Группа внутри ключа: одна дисциплина в одно время может идти у двух
+        # групп, и без группы в ключ такая пара не вводится.
         UniqueConstraint(
             "discipline_id",
+            "group_number",
             "lesson_date",
             "start_time",
-            name="uq_lessons_discipline_date_start",
+            name="uq_lessons_discipline_group_date_start",
         ),
         Index("ix_lessons_discipline_date", "discipline_id", "lesson_date"),
     )
@@ -195,9 +216,17 @@ class Lesson(Base, TimestampMixin):
         ForeignKey("disciplines.id", ondelete="CASCADE"),
         nullable=False,
     )
+    group_number: Mapped[str] = mapped_column(String(20), nullable=False)
     lesson_date: Mapped[date] = mapped_column(Date, nullable=False)
     start_time: Mapped[time] = mapped_column(Time, nullable=False)
     end_time: Mapped[time] = mapped_column(Time, nullable=False)
+    # NULL = пара не закрыта. Отдельный флаг нужен фронту: наличие строк ABSENT
+    # про закрытие не говорит (на пару могли прийти все), а по closed_at видно
+    # и факт, и момент.
+    closed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
 
     discipline: Mapped["Discipline"] = relationship(back_populates="lessons")
     attendance_records: Mapped[list["AttendanceRecord"]] = relationship(
@@ -213,6 +242,15 @@ class AttendanceRecord(Base, TimestampMixin):
     UNIQUE (student_id, lesson_id) - ключевое дополнение к схеме README:
     повторная доставка события от камеры или из очереди не должна создавать
     дубль, а должна обновлять существующую запись.
+
+    ABSENT - отдельная запись, а не отсутствие записи (закрывает открытый
+    вопрос плана 3.2.2, пункт 9.5). Такие строки создаёт закрытие пары,
+    у них entry_time IS NULL: времени входа не было, выдумывать его нельзя.
+
+    frame_object_key - адрес доказательного снимка этого распознавания
+    (бакет frames). Раньше ключ только проверялся на существование и
+    выбрасывался, поэтому через месяц нельзя было подтвердить ни одну
+    отметку - в том числе ту, которую преподаватель правит руками.
     """
 
     __tablename__ = "attendance_records"
@@ -227,6 +265,24 @@ class AttendanceRecord(Base, TimestampMixin):
             name="late_iff_delay_present",
         ),
         CheckConstraint("delay_minutes >= 0", name="delay_non_negative"),
+        # ABSENT и «не подошёл к камере» - одно и то же: времени входа нет.
+        # Оборот важен: PRESENT/LATE без entry_time невозможны, иначе
+        # журнал начал бы показывать присутствие без доказательства.
+        CheckConstraint(
+            "(status = 'ABSENT') = (entry_time IS NULL)",
+            name="absent_iff_no_entry_time",
+        ),
+        CheckConstraint(
+            f"frame_object_key IS NULL OR frame_object_key ~ '{FRAME_KEY_REGEX}'",
+            name="frame_key_format",
+        ),
+        # Кадра на строке без засчитанного входа быть не может: след -
+        # подтверждение входа, а не самостоятельный факт. Оборот важнее:
+        # он запрещает выдумать «доказательство» для ABSENT от закрытия пары.
+        CheckConstraint(
+            "entry_time IS NOT NULL OR frame_object_key IS NULL",
+            name="frame_key_requires_entry",
+        ),
         Index("ix_attendance_records_lesson_id", "lesson_id"),
         Index("ix_attendance_records_student_id", "student_id"),
         Index("ix_attendance_records_entry_time", "entry_time"),
@@ -241,9 +297,11 @@ class AttendanceRecord(Base, TimestampMixin):
         ForeignKey("lessons.id", ondelete="CASCADE"),
         nullable=False,
     )
-    entry_time: Mapped[datetime] = mapped_column(
+    # NULL ровно у ABSENT: студента камера не фиксировала. См. CHECK
+    # absent_iff_no_entry_time - он запрещает и обратный случай.
+    entry_time: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
-        nullable=False,
+        nullable=True,
     )
     status: Mapped[AttendanceStatus] = mapped_column(
         SAEnum(
@@ -255,6 +313,9 @@ class AttendanceRecord(Base, TimestampMixin):
         nullable=False,
     )
     delay_minutes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Nullable: ключа нет у ABSENT от закрытия пары и у строк, созданных до
+    # этой правки. Формат - одна константа FRAME_KEY_REGEX выше.
+    frame_object_key: Mapped[str | None] = mapped_column(String(512), nullable=True)
     is_manually_edited: Mapped[bool] = mapped_column(
         Boolean,
         nullable=False,
