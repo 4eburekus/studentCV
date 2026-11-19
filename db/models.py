@@ -163,6 +163,16 @@ class Discipline(Base, TimestampMixin):
     """Дисциплина. Схема журнала: один журнал - одна дисциплина."""
 
     __tablename__ = "disciplines"
+    __table_args__ = (
+        # Не глобальный UNIQUE(name): два преподавателя вправе вести предмет с
+        # одинаковым названием, различимы они именно парой «название +
+        # преподаватель». Без этого индекса админка за несколько кликов
+        # заводит «Программирование» x3, а выбрать дисциплину для пары
+        # становится невозможно.
+        UniqueConstraint(
+            "name", "teacher_id", name="uq_disciplines_name_teacher_id"
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
@@ -220,6 +230,10 @@ class Lesson(Base, TimestampMixin):
     lesson_date: Mapped[date] = mapped_column(Date, nullable=False)
     start_time: Mapped[time] = mapped_column(Time, nullable=False)
     end_time: Mapped[time] = mapped_column(Time, nullable=False)
+    # Аудитория. Nullable и без CHECK: на учёт посещаемости она не влияет, а
+    # старые пары (12 сидовых и всё, что уже в БД) её не имеют. Формат задаёт
+    # учебная часть, у нас нет справочника аудиторий.
+    room_number: Mapped[str | None] = mapped_column(String(50), nullable=True)
     # NULL = пара не закрыта. Отдельный флаг нужен фронту: наличие строк ABSENT
     # про закрытие не говорит (на пару могли прийти все), а по closed_at видно
     # и факт, и момент.

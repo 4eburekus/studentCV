@@ -17,7 +17,14 @@
 
 from fastapi import APIRouter, Depends
 
-from app.api.endpoints import attendance, lessons, photos, students
+from app.api.endpoints import (
+    attendance,
+    disciplines,
+    lessons,
+    photos,
+    students,
+    teachers,
+)
 from app.dependencies import get_current_teacher
 from app.api.openapi import R401
 
@@ -30,6 +37,12 @@ api_router = APIRouter(
 # /healthz подключается в app/main.py: это проверка готовности контейнера,
 # у healthcheck'а нет учётных данных, и в контракт для фронтенда он не входит.
 api_router.include_router(students.router, prefix="/students", tags=["students"])
+# Справочники для админ-панели. Порядок объявления важен для читаемости
+# контракта, а не для маршрутизации: пути не пересекаются.
+api_router.include_router(teachers.router, prefix="/teachers", tags=["teachers"])
+api_router.include_router(
+    disciplines.router, prefix="/disciplines", tags=["disciplines"]
+)
 # Фото живут и как вложенный ресурс студента (загрузка, список), и как
 # отдельный ресурс (удаление по id) - оба пути объявлены в photos.py, поэтому
 # подпрефикса здесь нет.

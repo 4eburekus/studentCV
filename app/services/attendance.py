@@ -25,15 +25,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
 from app.services import storage
+from app.services.lessons import LessonNotFound, get_lesson
 from app.services.students import get as get_student
 from db.enums import AttendanceStatus
 from db.models import AttendanceRecord, Discipline, Lesson, Student
 
-
-class LessonNotFound(Exception):
-    def __init__(self, lesson_id: int) -> None:
-        super().__init__(f"lesson {lesson_id} not found")
-        self.lesson_id = lesson_id
+# LessonNotFound и get_lesson импортируются из app/services/lessons.py.
+# Держать здесь свои копии нельзя: два класса с одним именем - это случай,
+# когда `except LessonNotFound` в эндпоинте не ловит исключение, брошенное
+# другим модулем, и админ получает 500 вместо 404.
 
 
 class InactiveStudent(Exception):
@@ -115,13 +115,6 @@ def classify(
     # delta == 0 (ровно в начало) - LATE с 0 минутами. Действующий CHECK
     # (delay_minutes >= 0 и LATE <=> NOT NULL) это допускает, схема не меняется.
     return AttendanceStatus.LATE, max(0, math.ceil(delta_seconds / 60))
-
-
-async def get_lesson(session: AsyncSession, lesson_id: int) -> Lesson:
-    lesson = await session.get(Lesson, lesson_id)
-    if lesson is None:
-        raise LessonNotFound(lesson_id)
-    return lesson
 
 
 async def _reload_record(

@@ -8,6 +8,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.endpoints import health
 from app.api.router import api_router
@@ -70,15 +71,37 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 def create_app() -> FastAPI:
+    settings = get_settings()
     app = FastAPI(
         title="StudentCV API",
         version="0.2",
         description=(
             "Учёт посещаемости через распознавание лиц. "
-            "Контракт для будущего фронтенда (Vue) - этот OpenAPI."
+            "Контракт для фронтенда - этот OpenAPI."
         ),
         lifespan=lifespan,
     )
+
+    # Фронт живёт на другом origin (Vite на 5173) и шлёт Authorization,
+    # поэтому каждый запрос предваряется OPTIONS-preflight. Без этого
+    # middleware браузер отклоняет запросы до того, как они дойдут до
+    # роутеров, и выглядит это как тишина в сети, а не как ошибка API.
+    #
+    # origins - список из конфига, не "*": wildcard с allow_credentials=True
+    # браузеры отвергают, а wildcard без учётных данных открыл бы API кому
+    # попало, при том что требование N11 (реальный вход) ещё не закрыто.
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[
+            origin.strip()
+            for origin in settings.cors_allow_origins.split(",")
+            if origin.strip()
+        ],
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type"],
+    )
+
     # healthz - вне /api/v1 и вне авторизации: это эндпоинт healthcheck'а
     # контейнера, у которого нет учётных данных, и он не входит в контракт
     # для фронтенда. Контрактные роутеры - под api_router.

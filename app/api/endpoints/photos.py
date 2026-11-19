@@ -34,6 +34,24 @@ async def _read_image(file: UploadFile) -> bytes:
     return payload
 
 
+def _read(photo) -> schemas.PhotoRead:
+    """ORM-объект -> ответ с готовым путём к байтам.
+
+    content_path собираем здесь, а не на фронте: клиент не должен знать
+    префикс API и то, что файл лежит в S3 под ключом photo_url. Именно из-за
+    такого «собрать самому» в контрактах появляются расхождения вида
+    «фронт ждёт /photos/1/raw, сервер отдаёт /photos/1/content».
+    """
+    return schemas.PhotoRead(
+        id=photo.id,
+        student_id=photo.student_id,
+        photo_url=photo.photo_url,
+        content_hash=photo.content_hash,
+        created_at=photo.created_at,
+        content_path=f"/api/v1/photos/{photo.id}/content",
+    )
+
+
 @router.post(
     "/students/{student_id}/photos",
     response_model=schemas.PhotoRead,
@@ -74,7 +92,7 @@ async def add_photo(
                 "max_photos": settings.max_photos,
             },
         ) from exc
-    return photo
+    return _read(photo)
 
 
 @router.get(
@@ -94,7 +112,7 @@ async def list_photos(
     settings = get_settings()
     total = len(items)
     return schemas.PhotoList(
-        items=items,
+        items=[_read(photo) for photo in items],
         total=total,
         min_photos=settings.min_photos,
         max_photos=settings.max_photos,
@@ -122,3 +140,76 @@ async def delete_photo(
     except photos_service.PhotoNotFound as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.get(
+    "/photos/{photo_id}/content",
+    responses=merge(R404, R503),
+)
+async def get_photo_content(
+    photo_id: int,
+    session: AsyncSession = Depends(get_session),
+) -> Response:
+    """Прокси эталона для <img> фронтенда.
+
+    Браузер не получает S3 endpoint, ключи или имя бакета. Это особенно важно
+    в dist-варианте compose: SeaweedFS не должен быть публичным сервисом
+    только ради превью в админке.
+    """
+    try:
+        payload, content_type, etag = await photos_service.get_content(session, photo_id)
+    except photos_service.PhotoNotFound as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    except photos_service.PhotoObjectMissing as exc:
+        # Строка есть, объект пропал: это рассинхронизация, но клиенту полезнее
+        # 410, чем 500 - карточка может показать «объект отсутствует».
+        raise HTTPException(status.HTTP_410_GONE, str(exc)) from exc
+    except storage.StorageError as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+
+    return Response(
+        content=payload,
+        media_type=content_type,
+        headers={
+            "ETag": f'"{etag}"',
+            "Cache-Control": "private, max-age=3600",
+        },
+    )
+
+
+@router.put(
+    "/photos/{photo_id}/content",
+    response_model=schemas.PhotoRead,
+    responses=merge(R404, R503),
+)
+async def replace_photo_content(
+    photo_id: int,
+    file: UploadFile = File(...),
+    session: AsyncSession = Depends(get_session),
+) -> schemas.PhotoRead:
+    """Атомарная замена байтов существующего эталона."""
+    if file.content_type not in ALLOWED_CONTENT_TYPES:
+        raise HTTPException(
+            status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            f"unsupported content type {file.content_type!r}; "
+            f"allowed: {sorted(ALLOWED_CONTENT_TYPES)}",
+        )
+
+    try:
+        payload = await file.read()
+        photo = await photos_service.replace(
+            session, photo_id, payload, file.content_type or "image/jpeg"
+        )
+    except photos_service.PhotoNotFound as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    except (storage.StorageError, storage.ObjectNotFound) as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+
+    return schemas.PhotoRead(
+        id=photo.id,
+        student_id=photo.student_id,
+        photo_url=photo.photo_url,
+        content_hash=photo.content_hash,
+        created_at=photo.created_at,
+        content_path=f"/api/v1/photos/{photo.id}/content",
+    )

@@ -45,6 +45,25 @@ class InvalidImage(Exception):
     """
 
 
+class PhotoObjectMissing(Exception):
+    """Строка в БД есть, байтов в бакете нет.
+
+    Отдельная ошибка, а не PhotoNotFound: у этих двух случаев разные ответы и
+    разные виновники. «Нет строки» - админ удалил эталон, это 404. «Есть
+    строка, нет байтов» - рассинхронизация БД и хранилища, то есть наша
+    поломка: фронт обязан показать битый эталон, а не пустую карточку, а
+    распознавание тем временем потеряет этого студента молча.
+    """
+
+    def __init__(self, photo_id: int, key: str) -> None:
+        super().__init__(
+            f"photo {photo_id} exists in database but {key!r} is missing from "
+            "the bucket"
+        )
+        self.photo_id = photo_id
+        self.key = key
+
+
 class StudentNotActive(Exception):
     """Эталон нельзя завести выбывшему студенту.
 
@@ -149,6 +168,96 @@ async def remove(session: AsyncSession, photo_id: int) -> None:
     except StorageError:
         log.warning("photo row deleted but object %s stayed in bucket", key)
         raise
+
+
+def detect_content_type(payload: bytes) -> str:
+    """Тип содержимого по сигнатуре байтов, а не по колонке.
+
+    В БД type не хранится: StudentPhoto содержит ключ и хэш. Спрашивать его у
+    S3 (head_object) можно, но это сетевой round-trip на каждую отдачу
+    картинки, а принимают у нас только jpeg и png (ALLOWED_CONTENT_TYPES в
+    эндпоинте) - две сигнатуры читаются из первых байтов дешевле.
+    """
+    if payload[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if payload[:8].startswith(b"\x89PNG"):
+        return "image/png"
+    # До here этот файл обязан был пройти проверку при загрузке; не совпавшая
+    # сигнатура означает мусор в бакете, а не неизвестный нам формат.
+    return "application/octet-stream"
+
+
+async def get_content(session: AsyncSession, photo_id: int) -> tuple[bytes, str, str]:
+    """(байты, media_type, etag) эталона - для выдачи фронту.
+
+    ETag строится из content_hash: он уже является идентификатором содержимого,
+    поэтому картинка в браузере переиспользуется, а не грузится заново при
+    каждом открытии карточки студента.
+    """
+    photo = await session.get(StudentPhoto, photo_id)
+    if photo is None:
+        raise PhotoNotFound(photo_id)
+
+    settings = get_settings()
+    try:
+        payload = await storage.get_object(settings.s3_bucket_biometrics, photo.photo_url)
+    except (StorageError, storage.ObjectNotFound) as exc:
+        # Ловим оба намеренно: ObjectNotFound НЕ наследник StorageError (см.
+        # иерархию в storage.py). С «except StorageError» отсутствующий объект
+        # улетел бы наверх как 500, а это ровно тот случай, который нужно
+        # показать фронту как «эталон битый», а не «сервер сломался».
+        raise PhotoObjectMissing(photo_id, photo.photo_url) from exc
+
+    return payload, detect_content_type(payload), photo.content_hash
+
+
+async def replace(
+    session: AsyncSession,
+    photo_id: int,
+    payload: bytes,
+    content_type: str = "image/jpeg",
+) -> StudentPhoto:
+    """Замена эталона без выхода за правило 1-5.
+
+    Без этой операции «заменить фото» = delete + add: в промежутке студент
+    теряет эталон, а при отказе второй операции остаётся без него вовсе.
+
+    Порядок: новый объект -> строка -> старый объект. Если БД откажет, новый
+    файл удаляем и остаёмся со старым эталоном, то есть состояние не меняется
+    вовсе; если не удастся удалить старый файл, строка уже указывает на новый,
+    и осиротевший байт подберёт сверка (verify_objects).
+    """
+    if not payload:
+        raise InvalidImage("photo payload is empty")
+
+    photo = await session.get(StudentPhoto, photo_id)
+    if photo is None:
+        raise PhotoNotFound(photo_id)
+
+    settings = get_settings()
+    old_key = photo.photo_url
+    new_key = storage.new_biometric_key()
+    content_hash = storage.compute_content_hash(payload)
+
+    await storage.put_object(settings.s3_bucket_biometrics, new_key, payload, content_type)
+
+    photo.photo_url = new_key
+    photo.content_hash = content_hash
+    try:
+        await session.commit()
+    except Exception:
+        await session.rollback()
+        await storage.delete_object(settings.s3_bucket_biometrics, new_key)
+        raise
+
+    await session.refresh(photo)
+
+    try:
+        await storage.delete_object(settings.s3_bucket_biometrics, old_key)
+    except StorageError:
+        log.warning("photo %s replaced but old object %s stayed in bucket", photo_id, old_key)
+
+    return photo
 
 
 async def verify_objects(session: AsyncSession) -> list[str]:
