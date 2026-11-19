@@ -26,7 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import get_settings
 from app.services import storage
 from app.services.lessons import LessonNotFound, get_lesson
-from app.services.students import get as get_student
+from app.services.students import StudentNotFound, get as get_student
 from db.enums import AttendanceStatus
 from db.models import AttendanceRecord, Discipline, Lesson, Student
 
@@ -83,6 +83,33 @@ def _as_aware(value: datetime) -> datetime:
     return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
 
 
+def lesson_bounds(
+    lesson: Lesson, *, tz: timezone | None, end: bool = False
+) -> datetime:
+    """Граница пары (начало или конец) как aware-время в заданной зоне.
+
+    Зона передаётся, а не фиксируется: расписание хранит naive Date/Time без
+    зоны (открытый вопрос раздела 9 плана), и «во сколько началась пара» имеет смысл
+    только относительно того времени, с которым сравниваем.
+    """
+    return datetime.combine(
+        lesson.lesson_date,
+        lesson.end_time if end else lesson.start_time,
+        tzinfo=tz,
+    )
+
+
+def delay_minutes_from(captured_at: datetime, start_dt: datetime) -> int:
+    """Минуты опоздания от начала пары: округление вверх, не меньше нуля.
+
+    Единственный источник формулы: ею пользуются и приёмник событий
+    (classify), и ручная правка. Две копии формулы - способ получить журнал,
+    где за один и тот же вход автоматика посчитала 45 минут, а правка
+    преподавателя - 44.
+    """
+    return max(0, math.ceil((captured_at - start_dt).total_seconds() / 60))
+
+
 def classify(
     captured_at: datetime,
     lesson_start: time,
@@ -114,7 +141,7 @@ def classify(
 
     # delta == 0 (ровно в начало) - LATE с 0 минутами. Действующий CHECK
     # (delay_minutes >= 0 и LATE <=> NOT NULL) это допускает, схема не меняется.
-    return AttendanceStatus.LATE, max(0, math.ceil(delta_seconds / 60))
+    return AttendanceStatus.LATE, delay_minutes_from(captured_at, start_dt)
 
 
 async def _reload_record(
@@ -273,17 +300,6 @@ async def register(
     return record, outcome, lesson
 
 
-def lesson_end_dt(lesson: Lesson, *, tz: timezone = timezone.utc) -> datetime:
-    """Момент конца пары как aware-время - та же граница, что в classify().
-
-    Зона по умолчанию UTC, а не локальная: и Postgres, и backend в compose
-    живут в UTC (TZ нигде не переопределён), поэтому сравнение с now(UTC)
-    честно отвечает на вопрос «пара уже закончилась». classify() берёт зону
-    из приходящего события, здесь источника нет - поэтому фиксируем UTC.
-    """
-    return datetime.combine(lesson.lesson_date, lesson.end_time, tzinfo=tz)
-
-
 @dataclass(frozen=True)
 class ClosureReport:
     """Итог закрытия пары. Возвращаем числа, а не текст: по ним фронт
@@ -409,9 +425,9 @@ async def close_overdue_lessons(
     """Закрыть все истёкшие незакрытые пары. Возвращает число закрытых.
 
     Отбор в два шага специально: SQL отсекает по ДНЕВУ (индексируемо и дёшево),
-    а точную границу по минутам считает Python тем же lesson_end_dt, что и
-    весь остальной контур. Держать правило конца пары в одном месте важнее,
-    чем выиграть один round-trip на полной таблице пар.
+    а точную границу по минутам считает Python той же lesson_bounds(end=True),
+    что и весь остальной контур (classify, ручная правка). Держать правило
+    конца пары в одном месте важнее, чем выиграть один round-trip.
     """
     now = now or datetime.now(timezone.utc)
 
@@ -430,11 +446,233 @@ async def close_overdue_lessons(
 
     closed = 0
     for lesson in candidates:
-        if lesson_end_dt(lesson) > now:
+        if lesson_bounds(lesson, tz=now.tzinfo, end=True) > now:
             continue
         await close_lesson(session, lesson.id, now=now)
         closed += 1
     return closed
+
+
+class RecordNotFound(Exception):
+    def __init__(self, record_id: int) -> None:
+        super().__init__(f"attendance record {record_id} not found")
+        self.record_id = record_id
+
+
+class EntryTimeNotAllowed(Exception):
+    """Время входа противоречит статусу или выпало из суток пары.
+
+    Три случая, и все три - защита от данных, которые журнал показывать не
+    может:
+      - время без статуса PRESENT/LATE (обратная сторона CHECK
+        absent_iff_no_entry_time: у ABSENT времени входа быть не может);
+      - время в другой календарный день, чем пара: CHECK на окно пары в БД
+        нет, поэтому граница живёт здесь.
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+
+
+def normalize_manual_entry(
+    lesson: Lesson, status: AttendanceStatus, entry_time: datetime | None
+) -> tuple[datetime | None, int | None]:
+    """Приводит ручную отметку к виду, который примет схема.
+
+    Единая точка для создания и правки: два набора правил неизбежно
+    разъезжаются, а здесь каждое правило защищает конкретный CHECK.
+
+    Возвращает (entry_time, delay_minutes).
+    """
+    if status is AttendanceStatus.ABSENT:
+        # CHECK (status='ABSENT') = (entry_time IS NULL) требует ровно этого;
+        # молча проглотить присланное время было бы хуже отказа, а оставить
+        # его - сломать констрейнт на коммите.
+        return None, None
+
+    if entry_time is None:
+        raise EntryTimeNotAllowed("entry_time is required for PRESENT and LATE")
+
+    entry_time = _as_aware(entry_time)
+    if entry_time.date() != lesson.lesson_date:
+        raise EntryTimeNotAllowed(
+            f"entry_time {entry_time:%Y-%m-%d %H:%M} is on a different day "
+            f"than lesson {lesson.lesson_date}"
+        )
+
+    start_dt = lesson_bounds(lesson, tz=entry_time.tzinfo)
+
+    # Время ПОСЛЕ конца пары здесь разрешено намеренно: правило «не позже
+    # конца пары» ограничивает автоматику, а ручная правка существует именно
+    # для исключений из него (форс-мажор, сбой камеры, опоздание, которое
+    # преподаватель решил засчитать).
+    #
+    # PRESENT обязан остаться с delay = NULL независимо от присланного
+    # времени: CHECK late_iff_delay_present требует, чтобы задержка жила
+    # ровно у LATE. Преподаватель, проставивший «присутствовал» с временем
+    # после начала, сознательно не считает это опозданием - переспорить его
+    # формулой было бы неправильно.
+    delay = (
+        None
+        if status is AttendanceStatus.PRESENT
+        else delay_minutes_from(entry_time, start_dt)
+    )
+    return entry_time, delay
+
+
+class StudentNotInLessonGroup(Exception):
+    def __init__(self, student_id: int, lesson_group: str, student_group: str) -> None:
+        super().__init__(
+            f"student {student_id} is in group {student_group!r}, lesson group "
+            f"is {lesson_group!r}"
+        )
+
+
+async def _load_record_for_edit(
+    session: AsyncSession, *, record_id: int | None = None,
+    lesson_id: int | None = None, student_id: int | None = None,
+) -> AttendanceRecord | None:
+    """Запись для ручной правки - из базы, а не из identity map.
+
+    Тот же питфол, что и в _reload_record: get_student() тянет
+    attendance_records через lazy="selectin" и кладёт их в identity map, а
+    сессия с expire_on_commit=False не сбрасывает значения после commit.
+    Обычный get()/select() мог вернуть объект с устаревшими status и
+    delay_minutes, и правка записала бы поверх них только изменённые поля -
+    то есть журнал получил бы смесь старого и нового.
+    """
+    stmt = select(AttendanceRecord).execution_options(populate_existing=True)
+    if record_id is not None:
+        stmt = stmt.where(AttendanceRecord.id == record_id)
+    else:
+        stmt = stmt.where(
+            AttendanceRecord.lesson_id == lesson_id,
+            AttendanceRecord.student_id == student_id,
+        )
+    return (await session.execute(stmt)).scalar_one_or_none()
+
+
+async def update_record(
+    session: AsyncSession,
+    record_id: int,
+    *,
+    status: AttendanceStatus,
+    entry_time: datetime | None,
+) -> tuple[AttendanceRecord, int | None, datetime]:
+    """Ручная правка записи (требование №7).
+
+    Возвращает (запись, минуты опоздания, момент правки).
+
+    Что здесь происходит и почему именно так:
+
+    1. delay_minutes пересчитывается сервером той же формулой, что и в
+       classify(). Принимать его от клиента означало бы разрешить журнал,
+       где время и опоздание противоречат друг другу.
+
+    2. is_manually_edited ставится в True и больше никогда не сбрасывается.
+       Именно этот флаг upsert использует, чтобы автоматика не перетирала
+       решение преподавателя (см. register), поэтому снять его мог бы только
+       другой преподаватель - а различия между ними система пока не знает
+       (авторизация остаётся заглушкой, требование №11).
+
+    3. Ключ кадра при правке снимается. Он был доказательством АВТОМАТИЧЕСКОГО
+       входа; после того как отметку изменил человек, прежний кадр больше не
+       относится к записи, и оставлять его - способ показать преподавателю
+       «вот подтверждение», которого он сам же и отверг.
+
+    4. Запрет на изменение чужих пар здесь НЕ проверяется: сервер пока не
+       знает, кто такой current_teacher по-настоящему. Это ровно то, что
+       откроется вместе с реальным входом.
+    """
+    record = await _load_record_for_edit(session, record_id=record_id)
+    if record is None:
+        raise RecordNotFound(record_id)
+
+    lesson = await session.get(Lesson, record.lesson_id)
+    entry_time, delay = normalize_manual_entry(lesson, status, entry_time)
+    edited_at = datetime.now(timezone.utc)
+
+    record.status = status
+    record.entry_time = entry_time
+    record.delay_minutes = delay
+    record.frame_object_key = None
+    record.is_manually_edited = True
+    record.edited_at = edited_at
+
+    await session.commit()
+    await session.refresh(record)
+    return record, delay, edited_at
+
+
+async def set_manual_record(
+    session: AsyncSession,
+    lesson_id: int,
+    student_id: int,
+    *,
+    status: AttendanceStatus,
+    entry_time: datetime | None,
+) -> tuple[AttendanceRecord, int | None, datetime]:
+    """Поставить отметку вручную: создать или перезаписать (требование №7).
+
+    Нужна именно эта операция, а не только правка по record_id: до закрытия
+    пары у непрошедшего студента записи нет, и править по идентификатору
+    нечего - в журнале он висит как «Не отмечен». Требование №7 говорит
+    «добавление/редактирование», и здесь закрыты обе ветки.
+
+    Ключ (student_id, lesson_id) тот же, что у UNIQUE и у upsert автоматики,
+    поэтому «создать» и «перезаписать» - одна операция, а не две, и дубль
+    невозможен в принципе.
+
+    Отметку можно поставить и на закрытую пару: спорные ситуации чаще всего
+    возникают именно после закрытия.
+    """
+    lesson = await session.get(Lesson, lesson_id)
+    if lesson is None:
+        raise LessonNotFound(lesson_id)
+
+    # get_student бросает StudentNotFound - тот же класс и тот же текст, что
+    # и в приёмнике событий; своя проверка через session.get() дала бы
+    # расхождение в формулировках 404 для одного и того же случая.
+    student = await get_student(session, student_id)
+
+    # Студент чужой группы - единственное, что здесь действительно стоит
+    # отвергнуть: журнал пары строится по группе, и отметка «не из этой
+    # оперы» потом выглядела бы как данные, которых не может быть.
+    if student.group_number != lesson.group_number:
+        raise StudentNotInLessonGroup(student_id, lesson.group_number, student.group_number)
+
+    entry_time, delay = normalize_manual_entry(lesson, status, entry_time)
+    edited_at = datetime.now(timezone.utc)
+
+    record = await _load_record_for_edit(
+        session, lesson_id=lesson_id, student_id=student_id
+    )
+
+    if record is None:
+        record = AttendanceRecord(
+            student_id=student_id,
+            lesson_id=lesson_id,
+            entry_time=entry_time,
+            status=status,
+            delay_minutes=delay,
+            # Кадра у ручной отметки нет по определению: его некому было
+            # сделать. CHECK frame_key_requires_entry это и сторожит.
+            frame_object_key=None,
+            is_manually_edited=True,
+            edited_at=edited_at,
+        )
+        session.add(record)
+    else:
+        record.status = status
+        record.entry_time = entry_time
+        record.delay_minutes = delay
+        record.frame_object_key = None
+        record.is_manually_edited = True
+        record.edited_at = edited_at
+
+    await session.commit()
+    await session.refresh(record)
+    return record, delay, edited_at
 
 
 async def journal_for_lesson(

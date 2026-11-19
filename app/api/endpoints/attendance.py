@@ -152,6 +152,7 @@ async def get_journal(
             delay_minutes=record.delay_minutes,
             is_manually_edited=record.is_manually_edited,
             frame_object_key=record.frame_object_key,
+            edited_at=record.edited_at,
         )
         for record, student in pairs
     ]
@@ -170,4 +171,95 @@ async def get_journal(
         ),
         entries=entries,
         total=len(entries),
+    )
+
+
+@router.post(
+    "/records",
+    response_model=schemas.AttendanceRecordUpdateResult,
+    status_code=status.HTTP_201_CREATED,
+    responses=merge(R404, R422),
+)
+async def set_attendance_record(
+    payload: schemas.AttendanceRecordSet,
+    session: AsyncSession = Depends(get_session),
+) -> schemas.AttendanceRecordUpdateResult:
+    """Проставить отметку вручную по паре и студенту (требование №7).
+
+    PATCH по record_id для этого не годится: до закрытия пары у студента без
+    отметки записи нет, и править нечего. POST закрывает «добавление» из
+    формулировки требования, а правила времени, статуса и кадра у него ровно
+    те же, что у правки, - оба идут через normalize_manual_entry.
+
+    Если запись уже есть, она перезаписывается: ключ (student_id, lesson_id)
+    общий с UNIQUE и с upsert автоматики, поэтому «создать» и «исправить» -
+    одна операция, а дубль невозможен.
+    """
+    try:
+        record, delay, edited_at = await attendance_service.set_manual_record(
+            session,
+            payload.lesson_id,
+            payload.student_id,
+            status=payload.status,
+            entry_time=payload.entry_time,
+        )
+    except attendance_service.LessonNotFound as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    except attendance_service.StudentNotFound as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    except (
+        attendance_service.EntryTimeNotAllowed,
+        attendance_service.StudentNotInLessonGroup,
+    ) as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+
+    return schemas.AttendanceRecordUpdateResult(
+        record=record,
+        delay_minutes=delay,
+        edited_at=edited_at,
+    )
+
+
+@router.patch(
+    "/records/{record_id}",
+    response_model=schemas.AttendanceRecordUpdateResult,
+    responses=merge(R404, R422),
+)
+async def update_attendance_record(
+    record_id: int,
+    payload: schemas.AttendanceRecordUpdate,
+    session: AsyncSession = Depends(get_session),
+) -> schemas.AttendanceRecordUpdateResult:
+    """Ручная правка отметки (требование №7, задача 3.3.1).
+
+    Назначение - спорные ситуации: камера не узнала, студент был, но ушёл
+    раньше фиксации, отметка потерялась. Поэтому здесь можно и выставить
+    ABSENT по уже закрытой паре, и проставить вход там, где его не было.
+
+    Ключевые ограничения контракта (см. AttendanceRecordUpdate):
+      - delay_minutes сервер считает сам, от клиента он не принимается;
+      - время ПОСЛЕ конца пары разрешено - ручная правка для того и нужна;
+      - время вне суток пары отвергается: это опечатка, а не решение;
+      - правка снимает адрес кадра: прежний кадр был доказательством
+        автоматического входа, который преподаватель только что отверг.
+
+    После правки запись помечается is_manually_edited навсегда: автоматика её
+    больше не перетирает (см. условие upsert в register).
+    """
+    try:
+        record, delay, edited_at = await attendance_service.update_record(
+            session,
+            record_id,
+            status=payload.status,
+            entry_time=payload.entry_time,
+        )
+    except attendance_service.RecordNotFound as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, str(exc)) from exc
+    except attendance_service.EntryTimeNotAllowed as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+
+    return schemas.AttendanceRecordUpdateResult(
+        record=record,
+        delay_minutes=delay,
+        edited_at=edited_at,
     )

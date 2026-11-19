@@ -148,8 +148,16 @@ where not exists (
 # --- 2. LATE requires delay_minutes -----------------------------------------
 # The test creates its own lesson, so it does not depend on the seeds being loaded.
 Assert-SqlOk "create test discipline and lesson" @"
+-- Идемпотентно: после миграции 0004 пара (name, teacher_id) уникальна, и
+-- повторный прогон без этого условия падал бы на uq_disciplines_name_teacher_id.
+-- Тест обязан быть перезапускаемым: он же и есть проверка схемы для человека.
 insert into disciplines (name, teacher_id)
-select 'Smoke Discipline', id from teachers order by id limit 1;
+select 'Smoke Discipline', (select id from teachers order by id limit 1)
+where not exists (
+    select 1 from disciplines d2
+    where d2.name = 'Smoke Discipline'
+      and d2.teacher_id = (select id from teachers order by id limit 1)
+);
 
 insert into lessons (discipline_id, group_number, lesson_date, start_time, end_time)
 select d.id, '$validGroup', current_date + 60, time '08:30', time '10:00'

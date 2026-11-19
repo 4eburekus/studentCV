@@ -162,7 +162,13 @@ def test_filter_by_group(client: httpx.Client) -> None:
 
 def test_search_by_name(client: httpx.Client) -> None:
     student = make_student(client)
-    needle = student["full_name"].split()[1]  # фамилия
+    # Ищем по уникальному токену, а не по фамилии «Иванов».
+    # make_student даёт "Тест Иванов <hex>"; против накопленных в стенде
+    # сотен таких же «Ивановых» выдача с limit=50 и сортировкой по ФИО не
+    # гарантирует, что свежий студент попадёт на первую страницу - тест
+    # краснел не из-за поломки поиска, а из-за объёма данных. Уникальный
+    # токен проверяет ровно то же (ilike по full_name), но детерминированно.
+    needle = student["full_name"].split()[-1]
     r = client.get("/api/v1/students", params={"q": needle})
     assert r.status_code == 200
     assert student["id"] in {i["id"] for i in r.json()["items"]}

@@ -1,44 +1,104 @@
-import React, { useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { DataTable } from '../../components/ui/DataTable';
+import {
+  createTeacher,
+  deleteTeacher,
+  getTeachers,
+  patchTeacher,
+  setTeacherPassword,
+} from '../../services/api';
 
-// Моки по ERD
-const initialTeachers = [
-  { id: 1, full_name: 'Иванов Иван Иванович', login: 'teacher_ivan' },
-  { id: 2, full_name: 'Петров Петр Петрович', login: 'teacher_petr' },
-];
+const emptyForm = { full_name: '', login: '', password: '' };
 
 export const TeachersPage = () => {
-  const [teachers, setTeachers] = useState(initialTeachers);
+  const [teachers, setTeachers] = useState([]);
+  const [isLoading, setIsLoading] = useState(true);
+  const [error, setError] = useState(null);
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [editingItem, setEditingItem] = useState(null);
+  const [formData, setFormData] = useState(emptyForm);
+  const [isSaving, setIsSaving] = useState(false);
+  const [formError, setFormError] = useState(null);
 
-  const [formData, setFormData] = useState({ full_name: '', login: '', password: '' });
+  const load = useCallback(async () => {
+    setIsLoading(true);
+    setError(null);
+    try {
+      const data = await getTeachers();
+      setTeachers(data.items);
+    } catch (e) {
+      setError(e.detail || e.message || 'Не удалось загрузить преподавателей');
+    } finally {
+      setIsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
 
   const openCreate = () => {
     setEditingItem(null);
-    setFormData({ full_name: '', login: '', password: '' });
+    setFormData(emptyForm);
+    setFormError(null);
     setIsModalOpen(true);
   };
 
   const openEdit = (row) => {
     setEditingItem(row);
-    setFormData({ full_name: row.full_name, login: row.login, password: '' }); // Пароль не отдаем
+    // Пароль не отдаётся сервером и не заполняется: менять его можно только
+    // явным действием, иначе правка ФИО молча сбрасывала бы учётку.
+    setFormData({ full_name: row.full_name, login: row.login, password: '' });
+    setFormError(null);
     setIsModalOpen(true);
   };
 
-  const handleSave = (e) => {
+  const handleSave = async (e) => {
     e.preventDefault();
-    if (editingItem) {
-      setTeachers(prev => prev.map(t => t.id === editingItem.id ? { ...t, full_name: formData.full_name, login: formData.login } : t));
-    } else {
-      setTeachers(prev => [...prev, { ...formData, id: Date.now() }]); // В реале POST /teachers
+    setFormError(null);
+    setIsSaving(true);
+    try {
+      if (editingItem) {
+        await patchTeacher(editingItem.id, {
+          full_name: formData.full_name,
+          login: formData.login,
+        });
+      } else {
+        await createTeacher({
+          full_name: formData.full_name,
+          login: formData.login,
+          password: formData.password,
+        });
+      }
+      setIsModalOpen(false);
+      await load();
+    } catch (err) {
+      // 409 — логин занят; приходит текстом detail и показывается как есть,
+      // потому что админу нужно знать, какое именно поле конфликтует.
+      setFormError(err.detail || 'Не удалось сохранить');
+    } finally {
+      setIsSaving(false);
     }
-    setIsModalOpen(false);
   };
 
-  const handleDelete = (id) => {
-    if (window.confirm('Удалить преподавателя?')) {
-      setTeachers(prev => prev.filter(t => t.id !== id));
+  const handlePassword = async (row) => {
+    const password = window.prompt(`Новый пароль для «${row.full_name}» (минимум 8 символов)`);
+    if (!password) return;
+    try {
+      await setTeacherPassword(row.id, password);
+      window.alert('Пароль изменён');
+    } catch (err) {
+      window.alert(err.detail || 'Не удалось изменить пароль');
+    }
+  };
+
+  const handleDelete = async (row) => {
+    if (!window.confirm(`Удалить преподавателя «${row.full_name}»?`)) return;
+    try {
+      await deleteTeacher(row.id);
+      await load();
+    } catch (err) {
+      // 409 — за преподавателем числятся дисциплины: удаление задело бы
+      // журнал, поэтому сервер отказывает. Показываем это текстом.
+      window.alert(err.detail || 'Не удалось удалить');
     }
   };
 
@@ -51,7 +111,8 @@ export const TeachersPage = () => {
       render: (_, row) => (
         <div className="flex gap-3">
           <button onClick={() => openEdit(row)} className="text-blue-600 hover:underline">Ред.</button>
-          <button onClick={() => handleDelete(row.id)} className="text-red-600 hover:underline">Удал.</button>
+          <button onClick={() => handlePassword(row)} className="text-gray-600 hover:underline">Пароль</button>
+          <button onClick={() => handleDelete(row)} className="text-red-600 hover:underline">Удал.</button>
         </div>
       ),
     },
@@ -66,9 +127,20 @@ export const TeachersPage = () => {
         </button>
       </div>
 
-      <DataTable data={teachers} columns={columns} emptyMessage="Нет преподавателей" />
+      {error && (
+        <div className="bg-red-50 border border-red-200 text-red-700 text-sm px-4 py-3 rounded-lg">
+          {error}
+          <button onClick={load} className="ml-3 underline">Повторить</button>
+        </div>
+      )}
 
-      {/* Модалка создания/редактирования */}
+      <DataTable
+        data={teachers}
+        columns={columns}
+        loading={isLoading}
+        emptyMessage="Нет преподавателей"
+      />
+
       {isModalOpen && (
         <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4">
           <div className="bg-white rounded-xl shadow-xl w-full max-w-md overflow-hidden">
@@ -88,12 +160,20 @@ export const TeachersPage = () => {
               {!editingItem && (
                 <div>
                   <label className="block text-sm font-semibold mb-1">Пароль</label>
-                  <input required type="password" value={formData.password} onChange={e => setFormData({ ...formData, password: e.target.value })} className="w-full border rounded-lg px-3 py-2 text-sm" />
+                  <input required minLength={8} type="password" value={formData.password} onChange={e => setFormData({ ...formData, password: e.target.value })} className="w-full border rounded-lg px-3 py-2 text-sm" />
+                  <p className="text-xs text-gray-500 mt-1">Минимум 8 символов</p>
+                </div>
+              )}
+              {formError && (
+                <div className="bg-red-50 border border-red-200 text-red-700 text-sm px-3 py-2 rounded">
+                  {formError}
                 </div>
               )}
               <div className="pt-2 flex gap-3">
                 <button type="button" onClick={() => setIsModalOpen(false)} className="flex-1 py-2 border rounded-lg hover:bg-gray-50">Отмена</button>
-                <button type="submit" className="flex-1 py-2 bg-blue-700 text-white rounded-lg hover:bg-blue-800">Сохранить</button>
+                <button type="submit" disabled={isSaving} className="flex-1 py-2 bg-blue-700 text-white rounded-lg hover:bg-blue-800 disabled:opacity-50">
+                  {isSaving ? 'Сохранение…' : 'Сохранить'}
+                </button>
               </div>
             </form>
           </div>
